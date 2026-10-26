@@ -1,0 +1,469 @@
+// Copyright (c) 2026 FairYan
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ============================================================
+// Godot MCP Server - Godot CLI Detection and Execution
+// ============================================================
+import { execSync, execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+const execFileAsync = promisify(execFile);
+// Track spawned processes for output monitoring
+const spawnedProcesses = new Map();
+const MAX_OUTPUT_LINES = 200;
+/**
+ * Find the Godot binary on the system.
+ * Checks in order:
+ * 1. GODOT_PATH environment variable
+ * 2. Common macOS locations
+ * 3. PATH
+ * 4. Common Linux/Windows locations
+ */
+export function findGodotBinary(godotPath) {
+    // 1. Explicit path from argument or env
+    if (godotPath) {
+        if (fs.existsSync(godotPath))
+            return godotPath;
+        return null;
+    }
+    const envPath = process.env.GODOT_PATH;
+    if (envPath && fs.existsSync(envPath)) {
+        return envPath;
+    }
+    // 2. Common macOS locations (Godot 4.x only — Godot 3 is not supported)
+    if (os.platform() === 'darwin') {
+        const godot4Versions = ['4.0', '4.1', '4.2', '4.3', '4.4', '4.5', '4.6', '4.7', '4.8', '4.9', '5.0'];
+        const macPaths = [
+            '/Applications/Godot.app/Contents/MacOS/Godot',
+            ...godot4Versions.map(v => `/Applications/Godot_${v}.app/Contents/MacOS/Godot`),
+            path.join(os.homedir(), 'Applications/Godot.app/Contents/MacOS/Godot'),
+        ];
+        for (const p of macPaths) {
+            if (fs.existsSync(p))
+                return p;
+        }
+        // Try to find any Godot*.app
+        try {
+            const appsDir = '/Applications';
+            const found = fs.readdirSync(appsDir)
+                .filter(f => f.startsWith('Godot') && f.endsWith('.app'))
+                .map(f => path.join(appsDir, f, 'Contents/MacOS', f.replace('.app', '')));
+            for (const f of found) {
+                if (fs.existsSync(f))
+                    return f;
+            }
+        }
+        catch {
+            // ignore
+        }
+        // Try home Applications
+        try {
+            const homeAppsDir = path.join(os.homedir(), 'Applications');
+            if (fs.existsSync(homeAppsDir)) {
+                const found = fs.readdirSync(homeAppsDir)
+                    .filter(f => f.startsWith('Godot') && f.endsWith('.app'))
+                    .map(f => path.join(homeAppsDir, f, 'Contents/MacOS', f.replace('.app', '')));
+                for (const f of found) {
+                    if (fs.existsSync(f))
+                        return f;
+                }
+            }
+        }
+        catch {
+            // ignore
+        }
+    }
+    // 3. Check PATH
+    try {
+        const whichResult = execSync('which godot 2>/dev/null || which Godot 2>/dev/null', {
+            encoding: 'utf-8',
+        }).trim();
+        if (whichResult && fs.existsSync(whichResult)) {
+            return whichResult;
+        }
+    }
+    catch {
+        // not found in PATH
+    }
+    // 4. Linux snap/flatpak
+    if (os.platform() === 'linux') {
+        const linuxPaths = [
+            '/snap/bin/godot',
+            '/var/lib/flatpak/exports/bin/org.godotengine.Godot',
+        ];
+        for (const p of linuxPaths) {
+            if (fs.existsSync(p))
+                return p;
+        }
+    }
+    // 5. Windows common install paths
+    if (os.platform() === 'win32') {
+        const winPaths = [
+            'C:\\Program Files\\Godot\\Godot.exe',
+            'C:\\Program Files (x86)\\Godot\\Godot.exe',
+            path.join(os.homedir(), 'AppData\\Local\\Programs\\Godot\\Godot.exe'),
+        ];
+        for (const p of winPaths) {
+            if (fs.existsSync(p))
+                return p;
+        }
+    }
+    return null;
+}
+/**
+ * Get Godot version information (async — does not block the event loop).
+ */
+export async function getGodotVersion(godotPath) {
+    try {
+        const { stdout } = await execFileAsync(godotPath, ['--version'], { timeout: 5000 });
+        const version = (stdout || '').trim();
+        return {
+            version: version || 'unknown',
+            path: godotPath,
+            platform: os.platform(),
+        };
+    }
+    catch {
+        return {
+            version: 'unknown',
+            path: godotPath,
+            platform: os.platform(),
+        };
+    }
+}
+/**
+ * Track a spawned process: capture its stdout/stderr into a bounded ring buffer
+ * and register it in `spawnedProcesses`. The entry is automatically removed
+ * 60s after the process exits (output stays available for `monitor_output`
+ * queries in the meantime), preventing unbounded memory growth.
+ */
+function trackProcess(proc) {
+    const output = [];
+    proc.stdout?.on('data', (data) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            if (output.length >= MAX_OUTPUT_LINES)
+                output.shift();
+            output.push(line);
+        }
+    });
+    proc.stderr?.on('data', (data) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            if (output.length >= MAX_OUTPUT_LINES)
+                output.shift();
+            output.push(line);
+        }
+    });
+    const pid = proc.pid || -1;
+    spawnedProcesses.set(pid, { process: proc, output });
+    proc.unref();
+    // 进程退出后 60s 自动清理 map 条目，避免长期运行内存增长
+    proc.on('exit', () => {
+        const timer = setTimeout(() => {
+            spawnedProcesses.delete(pid);
+        }, 60_000);
+        timer.unref?.();
+    });
+}
+/**
+ * Launch Godot editor for a project.
+ */
+export function launchGodotEditor(godotPath, projectPath, scene) {
+    const args = ['--path', projectPath, '-e'];
+    if (scene) {
+        args.push(scene);
+    }
+    const proc = spawn(godotPath, args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const spawned = {
+        pid: proc.pid || -1,
+        command: `${godotPath} ${args.join(' ')}`,
+        startedAt: new Date().toISOString(),
+    };
+    trackProcess(proc);
+    return spawned;
+}
+/**
+ * Run a Godot project.
+ */
+export function runGodotProject(godotPath, projectPath, options) {
+    const args = ['--path', projectPath];
+    if (options?.scene) {
+        args.push(options.scene);
+    }
+    if (options?.headless) {
+        args.push('--headless');
+    }
+    if (options?.debug) {
+        args.push('--debug');
+    }
+    if (options?.window_size) {
+        args.push('--resolution', options.window_size);
+    }
+    const proc = spawn(godotPath, args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const spawned = {
+        pid: proc.pid || -1,
+        command: `${godotPath} ${args.join(' ')}`,
+        startedAt: new Date().toISOString(),
+    };
+    // trackProcess 负责捕获输出、登记 map，并在进程退出 60s 后自动清理条目，
+    // 避免 run/export 进程长期积累导致 map 无限增长。
+    trackProcess(proc);
+    return spawned;
+}
+/**
+ * Export a Godot project using an export preset.
+ * godot --path <project> --export <preset> <output_path>
+ */
+export function exportGodotProject(godotPath, projectPath, preset, outputPath) {
+    const args = ['--path', projectPath, '--export', preset, outputPath];
+    const proc = spawn(godotPath, args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const spawned = {
+        pid: proc.pid || -1,
+        command: `${godotPath} ${args.join(' ')}`,
+        startedAt: new Date().toISOString(),
+    };
+    trackProcess(proc);
+    return spawned;
+}
+/**
+ * Get recent output from spawned processes.
+ */
+export function getRecentOutput(clear) {
+    const allOutput = [];
+    for (const [pid, data] of spawnedProcesses) {
+        if (data.output.length > 0) {
+            allOutput.push(`[PID ${pid}]`, ...data.output);
+            // Check if process is still running
+            try {
+                if (data.process.exitCode !== null) {
+                    allOutput.push(`[PID ${pid}] Process exited with code ${data.process.exitCode}`);
+                }
+            }
+            catch {
+                // process reference might be stale
+            }
+        }
+    }
+    if (clear) {
+        // 只清输出缓冲，绝不能清空整个 map —— 否则 stop_project/cleanupProcesses
+        // 会失去对仍在运行的 Godot 进程的句柄，无法再 kill。
+        for (const data of spawnedProcesses.values())
+            data.output.length = 0;
+    }
+    return allOutput;
+}
+/**
+ * Clean up all spawned processes.
+ */
+export function cleanupProcesses() {
+    for (const data of spawnedProcesses.values()) {
+        try {
+            data.process.kill();
+        }
+        catch {
+            // already dead
+        }
+    }
+    spawnedProcesses.clear();
+}
+/**
+ * Capture a screenshot of the running Godot window (async).
+ * Uses platform-native tools. All child processes are spawned with
+ * argument arrays (never shell strings) to prevent injection.
+ */
+export async function captureScreenshot(outputPath, windowTitle = 'Godot', delay = 1) {
+    const platform = os.platform();
+    try {
+        if (platform === 'darwin') {
+            const absPath = path.resolve(outputPath);
+            // Try to find the Godot game window by title
+            let windowID = '';
+            try {
+                // List all windows, find the one matching the title
+                const script = `tell application "System Events" to get name of every window of every process whose name contains "godot"`;
+                const { stdout: osaOutput } = await execFileAsync('osascript', ['-e', script], { timeout: 5000 });
+                if (osaOutput.trim()) {
+                    const findWindowScript = `
+            set windowList to {}
+            tell application "System Events"
+              repeat with p in (every process whose name contains "godot")
+                repeat with w in (every window of p)
+                  set end of windowList to (id of w) & "," & (name of w)
+                end repeat
+              end repeat
+            end tell
+            return windowList
+          `;
+                    const { stdout: windowListOut } = await execFileAsync('osascript', ['-e', findWindowScript], { timeout: 5000 });
+                    const windowList = windowListOut.trim();
+                    const lines = windowList.split(', ');
+                    for (let i = 0; i < lines.length - 1; i += 2) {
+                        const id = lines[i];
+                        const name = lines[i + 1];
+                        // Match: game window typically has the project name or "Godot Engine" / "Godot"
+                        if (name && (name.includes(windowTitle) || name.toLowerCase().includes('godot'))) {
+                            windowID = id;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch {
+                // osascript failed, fall back to active window capture
+            }
+            // Await the actual capture (spawn + promise, args passed literally, no shell)
+            if (windowID) {
+                await spawnAwait('screencapture', ['-T', String(delay), '-l', windowID, absPath], 15000);
+            }
+            else {
+                await spawnAwait('screencapture', ['-T', String(delay), '-w', absPath], 15000);
+            }
+            if (fs.existsSync(absPath)) {
+                return { success: true, message: `Screenshot saved to ${absPath} (${windowID ? `window #${windowID}` : 'active window'})`, path: absPath };
+            }
+            return { success: false, message: 'screencapture failed to create output file' };
+        }
+        if (platform === 'linux') {
+            const absPath = path.resolve(outputPath);
+            let captured = false;
+            try {
+                await spawnAwait('import', ['-window', 'root', '-delay', '100', absPath], 8000);
+                captured = fs.existsSync(absPath);
+            }
+            catch {
+                // fallback: try gnome-screenshot
+            }
+            if (!captured) {
+                try {
+                    await spawnAwait('gnome-screenshot', ['-f', absPath], 8000);
+                }
+                catch {
+                    // no screenshot tool available
+                }
+            }
+            if (fs.existsSync(absPath)) {
+                return { success: true, message: `Screenshot saved to ${absPath}`, path: absPath };
+            }
+            return { success: false, message: 'No Linux screenshot tool found (install imagemagick or gnome-screenshot)' };
+        }
+        if (platform === 'win32') {
+            // Windows: use PowerShell to capture screen.
+            // absPath is embedded as a PowerShell single-quoted literal; single quotes
+            // inside the path are escaped by doubling. Inside single quotes, $ and ;
+            // are literal, so no further escaping is needed.
+            const absPath = path.resolve(outputPath);
+            const psCmd = `Add-Type -AssemblyName System.Windows.Forms; $s=[System.Windows.Forms.Screen]::AllScreens[0]; $b=new-object Drawing.Bitmap($s.Bounds.Width,$s.Bounds.Height); $g=[Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($s.Bounds.Location, [Drawing.Point]::Empty, $s.Bounds.Size); $b.Save('${absPath.replace(/'/g, "''")}'); $g.Dispose(); $b.Dispose()`;
+            await spawnAwait('powershell', ['-Command', psCmd], 10000);
+            if (fs.existsSync(absPath)) {
+                return { success: true, message: `Screenshot saved to ${absPath}`, path: absPath };
+            }
+            return { success: false, message: 'PowerShell screenshot failed' };
+        }
+        return { success: false, message: `Unsupported platform: ${platform}` };
+    }
+    catch (err) {
+        return { success: false, message: `Screenshot error: ${err.message}` };
+    }
+}
+/** Spawn a process and await its exit (resolves even on non-zero exit code). */
+function spawnAwait(command, args, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, { stdio: 'ignore' });
+        const timer = setTimeout(() => {
+            try {
+                child.kill();
+            }
+            catch { /* best effort */ }
+            reject(new Error(`"${command}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        child.on('error', (err) => { clearTimeout(timer); reject(err); });
+        child.on('exit', () => { clearTimeout(timer); resolve(); });
+    });
+}
+/**
+ * Detect if the Godot editor is currently running (async).
+ * Also checks if any project is being played from the editor.
+ */
+export async function detectRunningGodot() {
+    const platform = os.platform();
+    const result = { running: false, editor: false, playing: false, pids: [] };
+    try {
+        let output = '';
+        if (platform === 'darwin' || platform === 'linux') {
+            const { stdout } = await execFileAsync('ps', ['aux'], { timeout: 3000 });
+            output = stdout;
+        }
+        else if (platform === 'win32') {
+            const { stdout } = await execFileAsync('tasklist', ['/FI', 'IMAGENAME eq Godot*'], { timeout: 3000 });
+            output = stdout;
+        }
+        // Filter to Godot-related lines. 关键：按「可执行文件名」匹配而不是整个命令行，
+        // 否则服务器自身进程（命令行路径常含 "Godot-MCP"）会被误判为正在运行的 Godot，
+        // 导致 is_editor_running 永远返回 true。
+        // ps aux 列：USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+        // COMMAND 是第 11 列（下标 10），其首个 token 为可执行文件路径。
+        const lines = output
+            .split('\n')
+            .filter((l) => {
+            if (!/godot/i.test(l) || /grep/.test(l) || l.trim().length === 0)
+                return false;
+            const parts = l.trim().split(/\s+/);
+            if (parts.length < (platform === 'win32' ? 2 : 11))
+                return false;
+            const exeName = (platform === 'win32' ? parts[0] : parts[10].split('/').pop() || '').toLowerCase();
+            // node/npx/WorkBuddy 等宿主进程即使路径含 "godot" 也不应算 Godot
+            return exeName.startsWith('godot');
+        });
+        if (lines.length === 0)
+            return result;
+        result.running = true;
+        for (const line of lines) {
+            // Extract PID (column 2 on macOS/Linux `ps aux`)
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 2) {
+                const pid = parts[1];
+                if (!isNaN(Number(pid)) && !result.pids.includes(pid)) {
+                    result.pids.push(pid);
+                }
+            }
+            // Detect if running as editor (has --editor, -e, or --path flags)
+            if (line.includes('--editor') || line.includes(' -e ') || line.includes('--path')) {
+                result.editor = true;
+            }
+        }
+        // Also check the spawnedProcesses map for editor/game processes
+        for (const [pid, data] of spawnedProcesses) {
+            if (data.process.exitCode === null) {
+                // Process still running
+                if (!result.pids.includes(String(pid))) {
+                    result.pids.push(String(pid));
+                }
+                if (data.process.spawnargs?.some((a) => a === '-e' || a === '--editor')) {
+                    result.editor = true;
+                }
+            }
+        }
+        // Check if any project is playing (has --project flag without -e)
+        for (const data of spawnedProcesses.values()) {
+            const args = data.process.spawnargs || [];
+            if (args.includes('--path') && !args.includes('-e') && !args.includes('--editor')) {
+                result.playing = true;
+            }
+        }
+        return result;
+    }
+    catch {
+        return result;
+    }
+}

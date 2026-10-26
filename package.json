@@ -1,0 +1,87 @@
+{
+  "name": "godot-mcp",
+  "version": "1.12.9-workflow.1",
+  "description": "The most complete MCP server for Godot Engine 4.x — 386 tools. Let Claude, Cursor, Copilot, Windsurf or any MCP client edit .tscn scenes, .tres resources, GDScript and shaders, drive the live editor, and control the running game (freeze, frame-step, screenshot). Godot 3 not supported.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "godot-mcp": "dist/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "godot",
+    "godot4",
+    "godot-mcp",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "godot-engine",
+    "game-engine",
+    "game-development",
+    "gamedev",
+    "gdscript",
+    "gdshader",
+    "shader",
+    "tscn",
+    "tres",
+    "ai",
+    "ai-agent",
+    "ai-assistant",
+    "llm",
+    "claude",
+    "cursor",
+    "copilot",
+    "windsurf",
+    "cline",
+    "anthropic",
+    "automation",
+    "scene-editor",
+    "level-design",
+    "game-ai-tools",
+    "godot-plugin",
+    "godot-addon",
+    "debugger",
+    "typescript"
+  ],
+  "author": "",
+  "publisher": "yanhuifair",
+  "license": "AGPL-3.0-or-later",
+  "icon": "godot.png",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanhuifair/Godot-MCP.git"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "vscode": "^1.90.0"
+  },
+  "activationEvents": [],
+  "categories": [
+    "Other"
+  ],
+  "contributes": {
+    "mcpServers": {
+      "servers": {
+        "godot-mcp": {
+          "type": "stdio",
+          "command": "node",
+          "args": [
+            "${extensionPath}/dist/index.js"
+          ]
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "express": "5.3.0",
+    "zod": "3.25.76",
+    "zod-to-json-schema": "3.25.2"
+  },
+  "private": true
+}

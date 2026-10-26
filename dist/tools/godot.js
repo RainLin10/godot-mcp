@@ -1,0 +1,282 @@
+// Copyright (c) 2026 FairYan
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ============================================================
+// Godot MCP Server - Godot Engine Control Tools
+// ============================================================
+import { z } from 'zod';
+import { plainError, toolError, ErrorCode } from '../utils/errors.js';
+import { findGodotBinary, getGodotVersion, launchGodotEditor, runGodotProject, exportGodotProject, getRecentOutput, cleanupProcesses, captureScreenshot, detectRunningGodot, } from '../utils/godot_cli.js';
+import { sendEditorCommand } from './editor_bridge.js';
+import { resolveProjectPath, isPathWithin, warnSkippedPath } from '../utils/file_utils.js';
+import fs from 'node:fs';
+import pathMod from 'node:path';
+// ---- Tool Schemas ----
+export const getGodotVersionSchema = {};
+export const launchEditorSchema = {
+    project_path: z.string().optional().describe('Project path (default: current project root; must resolve inside the project root)'),
+    scene: z.string().optional().describe('Scene to open on launch (e.g. "res://main.tscn")'),
+};
+export const runProjectSchema = {
+    project_path: z.string().optional().describe('Project path (default: current project root; must resolve inside the project root)'),
+    scene: z.string().optional().describe('Specific scene to run'),
+    headless: z.boolean().optional().default(false).describe('Run in headless mode (no window)'),
+    debug: z.boolean().optional().default(false).describe('Run with debugger'),
+    window_size: z.string().optional().describe('Window size (e.g. "1280x720", "1920x1080")'),
+};
+export const monitorOutputSchema = {
+    clear: z.boolean().optional().default(false).describe('Clear accumulated output after reading'),
+};
+export const exportProjectSchema = {
+    preset: z.string().min(1).describe('Export preset name (as defined in your export_presets.cfg, e.g. "Windows Desktop", "Linux/X11")'),
+    output_path: z.string().min(1).describe('Output file path for the exported build (resolved inside the project root)'),
+    project_path: z.string().optional().describe('Project path (default: current project root; must resolve inside the project root)'),
+};
+export const captureScreenshotSchema = {
+    output_path: z.string().optional().default('screenshot.png').describe('Output file path for the screenshot'),
+    window_title: z.string().optional().describe('Window title to capture (default: capture Godot window)'),
+    delay: z.number().optional().default(1).describe('Delay in seconds before capture'),
+};
+export const stopProjectSchema = {};
+export const isEditorRunningSchema = {};
+// ---- Tool Handlers ----
+export async function handleGetGodotVersion() {
+    try {
+        const binaryPath = findGodotBinary();
+        if (!binaryPath) {
+            return toolError(ErrorCode.GODOT_NOT_FOUND, 'Godot binary not found. Set GODOT_PATH environment variable or install Godot in /Applications/.');
+        }
+        const info = await getGodotVersion(binaryPath);
+        const lines = [
+            `Godot Version: ${info.version}`,
+            `Binary Path: ${info.path}`,
+            `Platform: ${info.platform}`,
+        ];
+        // Warn if Godot 3.x is detected (not supported)
+        const majorMatch = info.version.match(/^(\d+)\./);
+        if (majorMatch && parseInt(majorMatch[1], 10) < 4) {
+            lines.push('');
+            lines.push('⚠️  WARNING: Godot 3.x detected. This MCP server only supports Godot 4.x.');
+            lines.push('    Please install Godot 4.x from https://godotengine.org/download');
+        }
+        return {
+            content: [{ type: 'text', text: lines.join('\n') }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.GODOT_CLI_ERROR, `Error getting Godot version: ${err.message}`);
+    }
+}
+export function handleLaunchEditor(projectRoot, args) {
+    try {
+        const binaryPath = findGodotBinary();
+        if (!binaryPath) {
+            return toolError(ErrorCode.GODOT_NOT_FOUND, 'Godot binary not found. Set GODOT_PATH or install Godot.');
+        }
+        const projectPath = args.project_path
+            ? resolveProjectPath(projectRoot, args.project_path)
+            : projectRoot;
+        const result = launchGodotEditor(binaryPath, projectPath, args.scene);
+        return {
+            content: [{ type: 'text', text: `Godot editor launched. PID: ${result.pid}\nCommand: ${result.command}` }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.PROCESS_ERROR, `Error launching editor: ${err.message}`);
+    }
+}
+export function handleRunProject(projectRoot, args) {
+    try {
+        const binaryPath = findGodotBinary();
+        if (!binaryPath) {
+            return toolError(ErrorCode.GODOT_NOT_FOUND, 'Godot binary not found. Set GODOT_PATH or install Godot.');
+        }
+        const projectPath = args.project_path
+            ? resolveProjectPath(projectRoot, args.project_path)
+            : projectRoot;
+        const result = runGodotProject(binaryPath, projectPath, {
+            scene: args.scene,
+            headless: args.headless,
+            debug: args.debug,
+            window_size: args.window_size,
+        });
+        const details = [`Godot project running. PID: ${result.pid}`, `Command: ${result.command}`];
+        if (args.window_size)
+            details.push(`Window: ${args.window_size}`);
+        return {
+            content: [{ type: 'text', text: details.join('\n') }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.PROCESS_ERROR, `Error running project: ${err.message}`);
+    }
+}
+export async function handleMonitorOutput(args) {
+    try {
+        const lines = [];
+        // 1. 读取 Godot 进程输出
+        const processOutput = getRecentOutput(args.clear);
+        if (processOutput.length > 0) {
+            lines.push('=== Godot Process Output ===');
+            lines.push(...processOutput);
+        }
+        // 2. 尝试读取编辑器插件输出
+        try {
+            const editorResult = await sendEditorCommand('get_editor_output');
+            const editorOutput = editorResult?.output || [];
+            if (editorOutput.length > 0) {
+                if (lines.length > 0)
+                    lines.push('');
+                lines.push('=== Editor Plugin Output ===');
+                lines.push(...editorOutput);
+            }
+        }
+        catch {
+            // 编辑器未连接，跳过
+        }
+        if (lines.length === 0) {
+            return {
+                content: [{ type: 'text', text: 'No recent Godot output available. (Editor plugin not connected, no spawned processes.)' }],
+            };
+        }
+        return {
+            content: [{ type: 'text', text: lines.join('\n') }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error reading output: ${err.message}`);
+    }
+}
+export function handleExportProject(projectRoot, args) {
+    try {
+        const binaryPath = findGodotBinary();
+        if (!binaryPath) {
+            return toolError(ErrorCode.GODOT_NOT_FOUND, 'Godot binary not found. Set GODOT_PATH or install Godot.');
+        }
+        // 沙箱约束：project_path 与 output_path 都必须解析到当前项目根目录内。
+        // output_path 若不写死，Godot 会把导出产物写到任意路径（任意文件写入）。
+        const projectPath = args.project_path
+            ? resolveProjectPath(projectRoot, args.project_path)
+            : projectRoot;
+        const outputPath = resolveProjectPath(projectRoot, args.output_path);
+        const result = exportGodotProject(binaryPath, projectPath, args.preset, outputPath);
+        return {
+            content: [{ type: 'text', text: `Export started. PID: ${result.pid}\nPreset: ${args.preset}\nOutput: ${outputPath}\nCommand: ${result.command}\n\nUse monitor_output to check build progress.` }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.GODOT_CLI_ERROR, `Error exporting project: ${err.message}`);
+    }
+}
+export async function handleCaptureScreenshot(projectRoot, args) {
+    try {
+        // Keep the screenshot inside the project sandbox like every other write tool.
+        const outputPath = args.output_path
+            ? resolveProjectPath(projectRoot, args.output_path)
+            : pathMod.join(projectRoot, 'screenshot.png');
+        const result = await captureScreenshot(outputPath, args.window_title, args.delay);
+        if (result.success) {
+            return { content: [{ type: 'text', text: result.message }] };
+        }
+        return plainError(result.message);
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Screenshot error: ${err.message}`);
+    }
+}
+export function handleStopProject() {
+    try {
+        cleanupProcesses();
+        return { content: [{ type: 'text', text: 'All running Godot processes stopped.' }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.PROCESS_ERROR, `Error stopping Godot processes: ${err.message}`);
+    }
+}
+export async function handleIsEditorRunning() {
+    try {
+        const result = await detectRunningGodot();
+        if (!result.running) {
+            return { content: [{ type: 'text', text: 'No Godot process detected.' }] };
+        }
+        const lines = [];
+        lines.push(`Godot is running:`);
+        lines.push(`  Editor: ${result.editor ? 'yes ✅' : 'no'}`);
+        lines.push(`  Playing: ${result.playing ? 'yes ▶️' : 'no'}`);
+        lines.push(`  PIDs: ${result.pids.join(', ') || 'unknown'}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- Project Discovery ----
+export const listProjectsSchema = {
+    directory: z.string().optional().describe('Directory to search (default: current directory). Must be inside the project root or the server working directory — set GODOT_MCP_SCAN_ROOT to widen the search.'),
+    recursive: z.boolean().optional().default(true).describe('Search recursively (default: true)'),
+};
+export function handleListProjects(projectRoot, args) {
+    try {
+        const startDir = pathMod.resolve(args.directory || process.cwd());
+        // 这个工具会遍历磁盘并回显绝对路径，原本对 `directory` 完全不设限——
+        // 被提示注入的模型可以 `directory: "/Users"` 把整台机器的工程布局扫出来。
+        // 因此限定在「工程根 / 服务器工作目录」两棵子树内；确有需要时用
+        // GODOT_MCP_SCAN_ROOT 显式放宽（不设上限则只允许这两棵树）。
+        const allowedRoots = [projectRoot, process.cwd()].filter(Boolean).map((p) => pathMod.resolve(p));
+        const scanRootEnv = process.env.GODOT_MCP_SCAN_ROOT;
+        if (scanRootEnv)
+            allowedRoots.push(pathMod.resolve(scanRootEnv));
+        if (!allowedRoots.some((root) => isPathWithin(root, startDir))) {
+            return toolError(ErrorCode.PATH_TRAVERSAL, `Refusing to scan "${startDir}" — it is outside the allowed roots.`, `Allowed: ${allowedRoots.join(', ')}. Set GODOT_MCP_SCAN_ROOT=<dir> to widen the search.`);
+        }
+        if (!fs.existsSync(startDir) || !fs.statSync(startDir).isDirectory()) {
+            return toolError(ErrorCode.NOT_FOUND, `Not a directory: ${startDir}`);
+        }
+        const recursive = args.recursive !== false;
+        const isProject = (dir) => fs.existsSync(pathMod.join(dir, 'project.godot'));
+        const found = [];
+        function scan(dir, depth) {
+            if (depth > 4)
+                return;
+            let entries;
+            try {
+                entries = fs.readdirSync(dir, { withFileTypes: true });
+            }
+            catch (err) {
+                warnSkippedPath(dir, err, 'directory');
+                return;
+            }
+            for (const entry of entries) {
+                if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules')
+                    continue;
+                const fullPath = pathMod.join(dir, entry.name);
+                if (isProject(fullPath))
+                    found.push({ path: fullPath, name: entry.name });
+                if (recursive && found.length < 50)
+                    scan(fullPath, depth + 1);
+            }
+        }
+        if (isProject(startDir))
+            found.push({ path: startDir, name: pathMod.basename(startDir) });
+        scan(startDir, 0);
+        if (found.length === 0) {
+            return { content: [{ type: 'text', text: `No Godot projects found in ${startDir}` }] };
+        }
+        const lines = [`Godot Projects (${found.length}):`, ''];
+        for (const proj of found) {
+            let name = proj.name;
+            try {
+                const configContent = fs.readFileSync(pathMod.join(proj.path, 'project.godot'), 'utf-8');
+                const nameMatch = configContent.match(/config\/name="([^"]+)"/);
+                if (nameMatch)
+                    name = nameMatch[1];
+            }
+            catch { /* use folder name */ }
+            lines.push(`  ${proj.path}`);
+            lines.push(`    Name: ${name}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}

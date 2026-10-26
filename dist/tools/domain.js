@@ -1,0 +1,537 @@
+// Copyright (c) 2026 FairYan
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ============================================================
+// Godot MCP Server - Curve, Gradient, Path & Skeleton Tools
+// ============================================================
+import { z } from 'zod';
+import { toolError, ErrorCode } from '../utils/errors.js';
+import { forEachScene } from '../utils/scene_files.js';
+import { collectNodes } from '../utils/scene_walk.js';
+import { readTextFile, resolveProjectPath, writeTextFile } from '../utils/file_utils.js';
+import { parseResource } from '../parsers/resource_parser.js';
+import { parseScene, serializeScene } from '../parsers/scene_parser.js';
+// ---- Schemas ----
+export const readCurveSchema = {
+    path: z.string().describe('Path to .tres Curve resource'),
+};
+export const createCurveSchema = {
+    path: z.string().describe('Output path (e.g. "curves/ease_in.tres")'),
+    points: z.array(z.array(z.number())).optional().describe('Array of [x, y] control points'),
+    bake_resolution: z.number().optional().default(100).describe('Bake resolution'),
+};
+export const readGradientSchema = {
+    path: z.string().describe('Path to .tres Gradient resource'),
+};
+export const createGradientSchema = {
+    path: z.string().describe('Output path (e.g. "gradients/fire.tres")'),
+    colors: z.array(z.record(z.string())).optional().describe('Array of {offset, color} objects'),
+    interpolation_mode: z.enum(['linear', 'constant', 'cubic']).optional().default('linear'),
+};
+export const listPathsSchema = {
+    scene_path: z.string().optional().describe('Filter to scene'),
+};
+export const readPathSchema = {
+    scene_path: z.string().describe('Path to .tscn scene'),
+    name: z.string().optional().describe('Path2D/Path3D node name'),
+};
+export const listSkeletonsSchema = {
+    scene_path: z.string().optional().describe('Filter to scene'),
+};
+export const readSkeletonSchema = {
+    scene_path: z.string().describe('Path to .tscn scene'),
+    name: z.string().optional().describe('Skeleton3D node name'),
+};
+export const readReflectionProbeSchema = {
+    scene_path: z.string().optional().describe('Filter to scene'),
+};
+export const readMultiMeshSchema = {
+    scene_path: z.string().optional().describe('Filter to scene'),
+};
+export const createNoiseTextureSchema = {
+    path: z.string().describe('Output path for NoiseTexture2D .tres'),
+    width: z.number().optional().default(256).describe('Texture width'),
+    height: z.number().optional().default(256).describe('Texture height'),
+    seamless: z.boolean().optional().default(false).describe('Seamless tiling'),
+    noise_type: z.enum(['simplex', 'cellular', 'perlin', 'value']).optional().default('simplex'),
+};
+// ---- Helpers ----
+// ---- Curve Tools ----
+export function handleReadCurve(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        const { content } = readTextFile(absPath);
+        const doc = parseResource(content);
+        const lines = [];
+        lines.push(`Curve: ${doc.header.type}`);
+        lines.push(`File: ${args.path}`);
+        lines.push('');
+        for (const [key, val] of Object.entries(doc.resource)) {
+            const label = curvePropLabel(key);
+            lines.push(`  ${key} = ${val}${label ? `  # ${label}` : ''}`);
+        }
+        // Parse curve points
+        const points = [];
+        for (const key of Object.keys(doc.resource).sort()) {
+            const m = key.match(/_data\/points\/(\d+)\/(.+)$/);
+            if (m) {
+                const idx = parseInt(m[1], 10);
+                const field = m[2];
+                if (!points[idx])
+                    points[idx] = { pos: '?', left: '0', right: '0' };
+                switch (field) {
+                    case 'pos':
+                        points[idx].pos = doc.resource[key];
+                        break;
+                    case 'left_tangent':
+                        points[idx].left = doc.resource[key];
+                        break;
+                    case 'right_tangent':
+                        points[idx].right = doc.resource[key];
+                        break;
+                }
+            }
+        }
+        if (points.length > 0) {
+            lines.push('');
+            lines.push(`Control Points (${points.length}):`);
+            points.forEach((p, i) => {
+                lines.push(`  ${i}: pos=${p.pos}  tangent=[${p.left}, ${p.right}]`);
+            });
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export function handleCreateCurve(projectRoot, args) {
+    try {
+        let content = '[gd_resource type="Curve" format=3 uid=""]\n\n[resource]\n';
+        content += `bake_resolution = ${args.bake_resolution ?? 100}\n`;
+        if (args.points && args.points.length > 0) {
+            content += `_data = {\n"points": PackedFloat32Array(${args.points.flat().join(', ')}),\n`;
+            content += '"tilts": PackedFloat32Array()\n}\n';
+        }
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        writeTextFile(absPath, content, false);
+        const pts = args.points?.length || 0;
+        return { content: [{ type: 'text', text: `Curve created: ${args.path} (${pts} points)` }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- Gradient Tools ----
+export function handleReadGradient(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        const { content } = readTextFile(absPath);
+        const doc = parseResource(content);
+        const lines = [];
+        lines.push(`Gradient: ${doc.header.type}`);
+        lines.push(`File: ${args.path}`);
+        lines.push('');
+        const offsets = [];
+        for (const [key, val] of Object.entries(doc.resource)) {
+            const m = key.match(/offsets\/Pack.*?Array\((.*?)\)/);
+            const cm = key.match(/colors\/Pack.*?Array\((.*?)\)/);
+            if (!m && !cm) {
+                lines.push(`  ${key} = ${val}`);
+            }
+        }
+        // Parse gradient colors
+        for (const [key, val] of Object.entries(doc.resource)) {
+            if (key.startsWith('offsets')) {
+                const vals = val.match(/[\d.]+/g) || [];
+                vals.forEach((v, i) => {
+                    if (!offsets[i])
+                        offsets[i] = { offset: '', color: '' };
+                    offsets[i].offset = v;
+                });
+            }
+            if (key.startsWith('colors')) {
+                const matches = val.match(/Color\(([^)]+)\)/g) || [];
+                matches.forEach((c, i) => {
+                    if (!offsets[i])
+                        offsets[i] = { offset: '', color: '' };
+                    offsets[i].color = c;
+                });
+            }
+        }
+        if (offsets.length > 0) {
+            lines.push(`\nColor Stops (${offsets.length}):`);
+            offsets.forEach((s, i) => {
+                lines.push(`  ${i}: offset=${s.offset}  ${s.color}`);
+            });
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export function handleCreateGradient(projectRoot, args) {
+    try {
+        let content = '[gd_resource type="Gradient" format=3 uid=""]\n\n[resource]\n';
+        if (args.colors && args.colors.length > 0) {
+            const offsets = [];
+            const colorVals = [];
+            args.colors.forEach(c => {
+                offsets.push(parseFloat(c.offset || '0'));
+                colorVals.push(c.color || 'Color(1, 1, 1, 1)');
+            });
+            content += `offsets = PackedFloat32Array(${offsets.join(', ')})\n`;
+            content += `colors = PackedColorArray(${colorVals.join(', ')})\n`;
+        }
+        else {
+            content += `offsets = PackedFloat32Array(0, 1)\n`;
+            content += `colors = PackedColorArray(Color(0, 0, 0, 1), Color(1, 1, 1, 1))\n`;
+        }
+        if (args.interpolation_mode) {
+            const modes = { linear: 0, constant: 1, cubic: 2 };
+            content += `interpolation_mode = ${modes[args.interpolation_mode] || 0}\n`;
+        }
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        writeTextFile(absPath, content, false);
+        return { content: [{ type: 'text', text: `Gradient created: ${args.path}` }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- Path Tools ----
+export function handleListPaths(projectRoot, args) {
+    try {
+        const paths = [];
+        forEachScene(projectRoot, { scenePath: args.scene_path }, (doc, relPath) => {
+            for (const node of collectNodes(doc.nodes, ['Path2D', 'Path3D'])) {
+                const curve = node.properties['curve'] || '';
+                const pts = curve.match(/points/) ? 'has curve' : 'no curve';
+                paths.push({ scene: relPath, name: node.name, type: node.type, pointCount: pts });
+            }
+        });
+        if (paths.length === 0) {
+            return { content: [{ type: 'text', text: 'No Path2D/Path3D nodes found.' }] };
+        }
+        const lines = [`Paths (${paths.length}):`, ''];
+        paths.forEach(p => lines.push(`  ${p.scene} → ${p.name} (${p.type}) [${p.pointCount}]`));
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export function handleReadPath(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.scene_path);
+        const { content } = readTextFile(absPath);
+        const doc = parseScene(content);
+        const paths = collectNodes(doc.nodes, ['Path2D', 'Path3D']);
+        const target = args.name ? paths.find(p => p.name === args.name) : paths[0];
+        if (!target) {
+            return { content: [{ type: 'text', text: `No Path found in ${args.scene_path}` }] };
+        }
+        const lines = [];
+        lines.push(`Path: ${target.name} (${target.type})`);
+        for (const [key, val] of Object.entries(target.properties)) {
+            const label = key === 'curve' ? '  # Curve resource' : '';
+            const valStr = String(val);
+            const preview = valStr.length > 300 ? valStr.slice(0, 300) + '...' : valStr;
+            lines.push(`  ${key} = ${preview}${label}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- Skeleton Tools ----
+export function handleListSkeletons(projectRoot, args) {
+    try {
+        const skeletons = [];
+        forEachScene(projectRoot, { scenePath: args.scene_path }, (doc, relPath) => {
+            for (const node of collectNodes(doc.nodes, ['Skeleton3D', 'Skeleton2D'])) {
+                const bones = countBones(node);
+                skeletons.push({ scene: relPath, name: node.name, boneCount: String(bones) });
+            }
+        });
+        if (skeletons.length === 0) {
+            return { content: [{ type: 'text', text: 'No Skeleton nodes found.' }] };
+        }
+        const lines = [`Skeletons (${skeletons.length}):`, ''];
+        skeletons.forEach(s => lines.push(`  ${s.scene} → ${s.name} (${s.boneCount} bones)`));
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export function handleReadSkeleton(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.scene_path);
+        const { content } = readTextFile(absPath);
+        const doc = parseScene(content);
+        const skeletons = collectNodes(doc.nodes, ['Skeleton3D', 'Skeleton2D']);
+        const target = args.name ? skeletons.find(s => s.name === args.name) : skeletons[0];
+        if (!target) {
+            return { content: [{ type: 'text', text: `No Skeleton found in ${args.scene_path}` }] };
+        }
+        const lines = [];
+        lines.push(`Skeleton: ${target.name} (${target.type})`);
+        const boneList = extractBones(target);
+        lines.push(`\nBones (${boneList.length}):`);
+        if (boneList.length > 30) {
+            boneList.slice(0, 30).forEach(b => lines.push(`  ${b}`));
+            lines.push(`  ... and ${boneList.length - 30} more`);
+        }
+        else {
+            boneList.forEach(b => lines.push(`  ${b}`));
+        }
+        for (const [key, val] of Object.entries(target.properties)) {
+            if (key.startsWith('bones/'))
+                continue; // Skip individual bone properties
+            lines.push(`  ${key} = ${val}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- ReflectionProbe Tools ----
+export function handleReadReflectionProbe(projectRoot, args) {
+    try {
+        const probes = [];
+        forEachScene(projectRoot, { scenePath: args.scene_path }, (doc, relPath) => {
+            for (const node of collectNodes(doc.nodes, ['ReflectionProbe', 'VoxelGI', 'LightmapGI'])) {
+                probes.push({
+                    scene: relPath, name: node.name, type: node.type,
+                    size: node.properties['size'] || node.properties['extents'] || '?',
+                    update: node.properties['update_mode'] || 'auto',
+                });
+            }
+        });
+        if (probes.length === 0) {
+            return { content: [{ type: 'text', text: 'No ReflectionProbe/VoxelGI/LightmapGI nodes found.' }] };
+        }
+        const lines = [`GI Probes (${probes.length}):`, ''];
+        probes.forEach(p => lines.push(`  ${p.scene} → ${p.name} (${p.type})  size=${p.size}`));
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- MultiMesh ----
+export function handleReadMultiMesh(projectRoot, args) {
+    try {
+        const multis = [];
+        forEachScene(projectRoot, { scenePath: args.scene_path }, (doc, relPath) => {
+            for (const node of collectNodes(doc.nodes, ['MultiMeshInstance3D', 'MultiMeshInstance2D'])) {
+                multis.push({
+                    scene: relPath, name: node.name, type: node.type,
+                    count: node.properties['multimesh'] ? 'has mesh' : 'no mesh',
+                });
+            }
+        });
+        if (multis.length === 0) {
+            return { content: [{ type: 'text', text: 'No MultiMeshInstance nodes found.' }] };
+        }
+        const lines = [`MultiMesh Instances (${multis.length}):`, ''];
+        multis.forEach(m => lines.push(`  ${m.scene} → ${m.name} (${m.type}) [${m.count}]`));
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- NoiseTexture ----
+export function handleCreateNoiseTexture(projectRoot, args) {
+    try {
+        const noiseTypes = { simplex: 0, cellular: 1, perlin: 2, value: 3 };
+        const template = `[gd_resource type="NoiseTexture2D" format=3 uid=""]
+
+[resource]
+width = ${args.width ?? 256}
+height = ${args.height ?? 256}
+seamless = ${args.seamless ?? false}
+noise = SubResource("FastNoiseLite_resource")
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_resource"]
+noise_type = ${noiseTypes[args.noise_type || 'simplex'] || 0}
+`;
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        writeTextFile(absPath, template, false);
+        return { content: [{ type: 'text', text: `NoiseTexture2D created: ${args.path} (${args.width}x${args.height}, ${args.noise_type || 'simplex'})` }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+// ---- Internal Helpers ----
+function curvePropLabel(key) {
+    const labels = {
+        bake_resolution: 'Bake resolution (points)',
+        _data: 'Raw curve data',
+        min_value: 'Minimum output value',
+        max_value: 'Maximum output value',
+    };
+    return labels[key] || '';
+}
+function countBones(node) {
+    let count = 0;
+    for (const key of Object.keys(node.properties)) {
+        if (key.startsWith('bones/') && key.endsWith('/name'))
+            count++;
+    }
+    return count || 0;
+}
+function extractBones(node) {
+    const bones = [];
+    for (const [key, val] of Object.entries(node.properties)) {
+        const m = key.match(/^bones\/(\d+)\/(name|parent)$/);
+        if (m) {
+            const idx = parseInt(m[1], 10);
+            const field = m[2];
+            const existing = bones.find(b => b.idx === idx);
+            if (existing) {
+                if (field === 'name')
+                    existing.name = String(val);
+                else
+                    existing.parent = String(val);
+            }
+            else {
+                bones.push({ idx, name: field === 'name' ? String(val) : '', parent: field === 'parent' ? String(val) : '' });
+            }
+        }
+    }
+    bones.sort((a, b) => a.idx - b.idx);
+    return bones.map(b => `  bone_${b.idx}: ${b.name}  parent=${b.parent}`);
+}
+// ---- Additional domain tools (Tier1) ----
+export const createMultimeshSchema = {
+    path: z.string().describe('Output path for new MultiMesh .tres (e.g. "meshes/grass_multimesh.tres")'),
+    instance_count: z.number().int().optional().default(100).describe('Number of instances to allocate'),
+    mesh_path: z.string().optional().describe('Optional .tres Mesh path (res://...) to assign'),
+    transform_mode: z.enum(['none', 'transform_2d', 'transform_3d']).optional().default('transform_3d').describe('Transform format'),
+};
+export function handleCreateMultimesh(projectRoot, args) {
+    try {
+        const modes = { none: 0, transform_2d: 1, transform_3d: 2 };
+        const tf = modes[args.transform_mode || 'transform_3d'] ?? 2;
+        const count = args.instance_count ?? 100;
+        let content;
+        if (args.mesh_path) {
+            const rel = args.mesh_path.startsWith('res://') ? args.mesh_path.slice(6) : args.mesh_path;
+            content = `[gd_resource type="MultiMesh" load_steps=2 format=3 uid=""]
+
+[ext_resource type="Mesh" path="res://${rel}" id="1_mesh"]
+
+[resource]
+instance_count = ${count}
+transform_format = ${tf}
+mesh = ExtResource("1_mesh")
+`;
+        }
+        else {
+            content = `[gd_resource type="MultiMesh" format=3 uid=""]
+
+[resource]
+instance_count = ${count}
+transform_format = ${tf}
+`;
+        }
+        const absPath = resolveProjectPath(projectRoot, args.path);
+        writeTextFile(absPath, content, false);
+        return { content: [{ type: 'text', text: `MultiMesh created: ${args.path} (instances: ${count})` }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export const setSkeletonBonePoseSchema = {
+    scene_path: z.string().describe('Path to .tscn scene containing a Skeleton3D/2D node'),
+    skeleton: z.string().optional().describe('Skeleton node name (first found if omitted)'),
+    bone: z.string().describe('Name of the bone to pose'),
+    position: z.array(z.number()).optional().describe('Local position as [x, y, z]'),
+    rotation: z.array(z.number()).optional().describe('Local rotation as quaternion [x, y, z, w]'),
+    scale: z.array(z.number()).optional().describe('Local scale as [x, y, z]'),
+};
+export function handleSetSkeletonBonePose(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.scene_path);
+        const { content } = readTextFile(absPath);
+        const doc = parseScene(content);
+        const skeletons = collectNodes(doc.nodes, ['Skeleton3D', 'Skeleton2D']);
+        const skel = args.skeleton ? skeletons.find(s => s.name === args.skeleton) : skeletons[0];
+        if (!skel) {
+            return toolError(ErrorCode.FILE_NOT_FOUND, `No Skeleton node found in ${args.scene_path}`);
+        }
+        let idx = -1;
+        for (const [key, val] of Object.entries(skel.properties)) {
+            const m = key.match(/^bones\/(\d+)\/name$/);
+            if (m && String(val) === args.bone) {
+                idx = parseInt(m[1], 10);
+                break;
+            }
+        }
+        if (idx < 0) {
+            return toolError(ErrorCode.INVALID_ARGUMENT, `Bone "${args.bone}" not found in skeleton ${skel.name}`);
+        }
+        if (args.position)
+            skel.properties[`bones/${idx}/position`] = `Vector3(${args.position.join(', ')})`;
+        if (args.rotation)
+            skel.properties[`bones/${idx}/rotation`] = `Quaternion(${args.rotation.join(', ')})`;
+        if (args.scale)
+            skel.properties[`bones/${idx}/scale`] = `Vector3(${args.scale.join(', ')})`;
+        writeTextFile(absPath, serializeScene(doc), true);
+        return {
+            content: [{ type: 'text', text: `Bone "${args.bone}" posed in ${skel.name} (${args.scene_path})` }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}
+export const writePathCurveSchema = {
+    scene_path: z.string().describe('Path to .tscn scene containing a Path2D/Path3D node'),
+    path: z.string().optional().describe('Path node name (first found if omitted)'),
+    points: z.array(z.array(z.number())).describe('Control points as arrays of [x, y, z] (Path3D) or [x, y] (Path2D)'),
+    closed: z.boolean().optional().default(false).describe('Whether the curve is closed'),
+    bake_resolution: z.number().int().optional().default(100).describe('Curve bake resolution'),
+};
+export function handleWritePathCurve(projectRoot, args) {
+    try {
+        const absPath = resolveProjectPath(projectRoot, args.scene_path);
+        const { content } = readTextFile(absPath);
+        const doc = parseScene(content);
+        const paths = collectNodes(doc.nodes, ['Path2D', 'Path3D']);
+        const target = args.path ? paths.find(p => p.name === args.path) : paths[0];
+        if (!target) {
+            return toolError(ErrorCode.FILE_NOT_FOUND, `No Path node found in ${args.scene_path}`);
+        }
+        const flat = [];
+        for (const p of args.points) {
+            for (const c of p)
+                flat.push(c);
+        }
+        const id = `Curve_${Math.random().toString(36).slice(2, 9)}`;
+        doc.subResources.push({
+            type: target.type === 'Path3D' ? 'Curve3D' : 'Curve2D',
+            id,
+            properties: {
+                bake_resolution: String(args.bake_resolution ?? 100),
+                _data: `{\n"points": PackedFloat32Array(${flat.join(', ')}),\n"tilts": PackedFloat32Array()\n}`,
+            },
+        });
+        target.properties['curve'] = `SubResource("${id}")`;
+        target.properties['closed'] = String(args.closed ?? false);
+        writeTextFile(absPath, serializeScene(doc), true);
+        return {
+            content: [{ type: 'text', text: `Curve written to ${target.name} in ${args.scene_path} (${args.points.length} points, closed=${args.closed ?? false})` }],
+        };
+    }
+    catch (err) {
+        return toolError(ErrorCode.INTERNAL_ERROR, `Error: ${err.message}`);
+    }
+}

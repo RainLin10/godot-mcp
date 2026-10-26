@@ -1,0 +1,1533 @@
+// Copyright (c) 2026 FairYan
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ============================================================
+// Godot MCP Server — Editor Tools (schemas + handlers)
+// ============================================================
+// 与编辑器通信的传输细节在 editor_bridge.ts；这里只负责
+// 「schema 长什么样」和「拿到结果怎么变成 ToolResult」。
+// ============================================================
+import { z } from 'zod';
+import { ErrorCode, toolError, wrapError, plainError } from '../utils/errors.js';
+import { sendEditorCommand } from './editor_bridge.js';
+// ---- Tool Schemas ----
+export const editorGetSelectionSchema = {};
+export const editorSetSelectionSchema = {
+    node_path: z.string().describe('Node path to select'),
+    property: z.string().optional().describe('Property key to set'),
+    value: z.string().optional().describe('Property value'),
+};
+export const editorPlaySchema = {};
+export const editorStopSchema = {};
+export const editorUndoSchema = {};
+export const editorRedoSchema = {};
+export const editorSaveSchema = {};
+export const editorGetOpenSceneSchema = {};
+export const editorOpenAssetSchema = { path: z.string().describe('Asset path') };
+export const editorGetInfoSchema = {};
+export const editorReadCurrentSceneSchema = {};
+export const editorReloadSceneSchema = {};
+// New v1.0 schemas
+export const editorAddNodeSchema = {
+    type: z.string().describe('Node type (e.g. "Sprite2D", "CollisionShape2D")'),
+    name: z.string().optional().describe('Node name (auto-generated if omitted)'),
+    parent: z.string().optional().default('.').describe('Parent node path'),
+    properties: z.record(z.string()).optional().describe('Properties to set'),
+};
+export const editorRemoveNodeSchema = {
+    path: z.string().describe('Node path to remove'),
+};
+export const editorGetNodePropertiesSchema = {
+    path: z.string().describe('Node path to inspect'),
+};
+export const editorSetNodePropertiesSchema = {
+    path: z.string().describe('Node path'),
+    properties: z.record(z.string()).describe('Properties to set'),
+};
+export const editorRenameNodeSchema = {
+    path: z.string().describe('Node path'),
+    name: z.string().describe('New name'),
+};
+export const editorDuplicateNodeSchema = {
+    path: z.string().describe('Node path to duplicate'),
+    name: z.string().optional().describe('Name for duplicate'),
+};
+export const editorReparentNodeSchema = {
+    path: z.string().describe('Node path'),
+    new_parent: z.string().describe('New parent path'),
+};
+export const editorMoveNodeSchema = {
+    node_path: z.string().describe('Node path'),
+    position: z.string().describe('Position (e.g. "Vector2(100, 200)" or "Vector3(0, 5, 0)")'),
+};
+export const editorRunSpecificSceneSchema = {
+    scene: z.string().describe('Scene path to run (e.g. "res://scenes/level1.tscn")'),
+};
+export const editorRunGdscriptSchema = {
+    code: z.string().describe('GDScript code to execute in editor context'),
+};
+export const editorCreateScriptSchema = {
+    path: z.string().describe('Output path for new script'),
+    extends: z.string().optional().default('Node').describe('Base class'),
+    template: z.string().optional().describe('Template: empty, node_script, character, resource_script, signal'),
+};
+export const editorAttachScriptSchema = {
+    path: z.string().describe('Node path'),
+    script: z.string().describe('Script path to attach'),
+};
+export const editorSetBreakpointSchema = {
+    script: z.string().describe('Script path'),
+    line: z.number().describe('Line number'),
+};
+export const editorRemoveBreakpointSchema = {
+    script: z.string().describe('Script path'),
+    line: z.number().describe('Line number'),
+};
+export const editorGetBreakpointsSchema = {};
+export const editorSaveAllSchema = {};
+export const editorFocusSchema = {};
+export const editorOpenDockSchema = {
+    dock: z.string().describe('Dock name: filesystem, inspector, scene, output'),
+};
+export const editorListFilesystemSchema = {
+    path: z.string().optional().default('res://').describe('Directory path'),
+    recursive: z.boolean().optional().default(false),
+    pattern: z.string().optional().describe('Glob pattern (e.g. "*.gd")'),
+};
+export const editorHealthCheckSchema = {};
+export const editorDeleteSelectedSchema = {};
+export const editorGetRectSchema = {};
+export const editorShowInFilesystemSchema = {
+    path: z.string().describe('Path to reveal'),
+};
+// ---- Tool Handlers ----
+export async function handleEditorGetSelection() {
+    try {
+        const result = await sendEditorCommand('get_selection');
+        const lines = [`Selected (${result.selection?.length || 0}):`];
+        for (const n of (result.selection || [])) {
+            lines.push(`  ${n.path} — ${n.type} "${n.name}"`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetSelection(args) {
+    try {
+        const params = { node_path: args.node_path };
+        if (args.property)
+            params.property = args.property;
+        if (args.value)
+            params.value = args.value;
+        await sendEditorCommand('set_selection', params);
+        const msg = args.property
+            ? `Selected "${args.node_path}" + set ${args.property}=${args.value}`
+            : `Selected: ${args.node_path}`;
+        return { content: [{ type: 'text', text: msg }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorPlay() {
+    try {
+        await sendEditorCommand('play_project');
+        return { content: [{ type: 'text', text: 'Project started.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorStop() {
+    try {
+        await sendEditorCommand('stop_project');
+        return { content: [{ type: 'text', text: 'Project stopped.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorUndo() {
+    try {
+        const r = await sendEditorCommand('undo');
+        const text = r.undone ? `Undone: ${r.action || '(unnamed action)'}` : (r.message || 'Nothing to undo.');
+        return { content: [{ type: 'text', text }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRedo() {
+    try {
+        const r = await sendEditorCommand('redo');
+        const text = r.redone ? `Redone: ${r.action || '(unnamed action)'}` : (r.message || 'Nothing to redo.');
+        return { content: [{ type: 'text', text }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSave() {
+    try {
+        await sendEditorCommand('save_scene');
+        return { content: [{ type: 'text', text: 'Scene saved.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetOpenScene() {
+    try {
+        const r = await sendEditorCommand('get_open_scene');
+        if (r.scene) {
+            const lines = [`Scene: ${r.scene}`, `Root: ${r.root} (${r.root_type})`, `Children: ${r.child_count}`];
+            for (const c of (r.top_children || []))
+                lines.push(`  - ${c.name} [${c.type}]`);
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+        return { content: [{ type: 'text', text: 'No scene open.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorReadCurrentScene() {
+    try {
+        const r = await sendEditorCommand('get_current_scene_tree');
+        if (r.error)
+            return plainError(r.error);
+        const lines = [`Scene: ${r.scene || '(unsaved)'}`, `Nodes: ${r.node_count}`, ''];
+        for (const n of (r.tree || [])) {
+            let line = `${'  '.repeat(n.depth)}${n.name} [${n.type}]`;
+            if (n.position)
+                line += `  pos=${n.position}`;
+            if (n.text)
+                line += `  "${n.text}"`;
+            lines.push(line);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorOpenAsset(args) {
+    try {
+        await sendEditorCommand('open_asset', { path: args.path });
+        return { content: [{ type: 'text', text: `Opened: ${args.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetInfo() {
+    try {
+        // Single round-trip: plugin.gd `get_editor_info` returns the whole snapshot.
+        // Selection is not part of it, so fetch it alongside.
+        const [info, selection] = await Promise.all([
+            sendEditorCommand('get_editor_info'),
+            sendEditorCommand('get_selection').catch(() => ({ selection: [] })),
+        ]);
+        const v = info.version || {};
+        const lines = [
+            'Godot Editor:',
+            `  Version:       ${v.string || `${v.major ?? '?'}.${v.minor ?? '?'}.${v.patch ?? '?'}`}`,
+            `  Plugin:        v${info.plugin_version ?? '?'}`,
+            `  Language:      ${info.editor_language || '?'}   Scale: ${info.editor_scale ?? '?'}`,
+            `  Window:        ${info.editor_width}x${info.editor_height}`,
+            `  Playing:       ${info.playing ? `yes (${info.playing_scene || '?'})` : 'no'}`,
+            `  Scene:         ${info.open_scene || 'none'}`,
+            `  Open scenes:   ${(info.open_scenes || []).length}`,
+        ];
+        for (const s of (info.open_scenes || []))
+            lines.push(`    - ${s}`);
+        if (Array.isArray(info.unsaved_scenes)) {
+            lines.push(`  Unsaved:       ${info.unsaved_scenes.length}`);
+            for (const s of info.unsaved_scenes)
+                lines.push(`    * ${s}`);
+        }
+        lines.push(`  Selected:      ${selection.selection?.length || 0} node(s)`, `  FS directory:  ${info.current_directory || '?'}`, `  Movie Maker:   ${info.movie_maker ? 'on' : 'off'}   Distraction-free: ${info.distraction_free ? 'on' : 'off'}   Multi-window: ${info.multi_window ? 'on' : 'off'}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorReloadScene() {
+    try {
+        const r = await sendEditorCommand('reload_scene');
+        return { content: [{ type: 'text', text: `Reloaded: ${r.scene}\n${r.message}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- New v1.0 Handlers ----
+export async function handleEditorAddNode(args) {
+    try {
+        const r = await sendEditorCommand('add_node', {
+            type: args.type, name: args.name, parent: args.parent || '.', properties: args.properties || {},
+        });
+        const lines = [`Node added: ${r.name} (${r.type}) at ${r.path}`];
+        if (r.failed_properties?.length) {
+            lines.push(`Skipped unknown properties: ${r.failed_properties.join(', ')} — use editor_get_node_properties to list valid names.`);
+        }
+        if (r.undoable)
+            lines.push('Undoable in the editor (Ctrl+Z / editor_undo).');
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRemoveNode(args) {
+    try {
+        const r = await sendEditorCommand('remove_node', { path: args.path });
+        const suffix = r.undoable ? ' (undoable via Ctrl+Z / editor_undo)' : '';
+        return { content: [{ type: 'text', text: `Node removed: ${args.path}${suffix}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetNodeProperties(args) {
+    try {
+        const r = await sendEditorCommand('get_node_properties', { path: args.path });
+        const lines = [`${r.type}: ${r.node} (${r.path})`, `Properties (${Object.keys(r.properties || {}).length}):`, ''];
+        for (const [k, v] of Object.entries(r.properties || {})) {
+            lines.push(`  ${k} = ${v}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetNodeProperties(args) {
+    try {
+        const r = await sendEditorCommand('set_node_properties', { path: args.path, properties: args.properties });
+        const applied = r.applied?.length ?? r.updated ?? 0;
+        const lines = [`Properties updated on ${args.path}: ${applied} applied` +
+                (r.applied?.length ? ` (${r.applied.join(', ')})` : '')];
+        if (r.failed_properties?.length) {
+            lines.push(`Skipped ${r.failed_properties.length} unknown propertie(s): ${r.failed_properties.join(', ')}`);
+            lines.push('Use editor_get_node_properties to list the valid property names for this node.');
+        }
+        // 全部属性都无效时按失败上报，否则 AI 会以为改动生效了。
+        const allFailed = applied === 0 && (r.failed_properties?.length ?? 0) > 0;
+        return { content: [{ type: 'text', text: lines.join('\n') }], isError: allFailed };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRenameNode(args) {
+    try {
+        await sendEditorCommand('rename_node', args);
+        return { content: [{ type: 'text', text: `Renamed ${args.path} → ${args.name}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDuplicateNode(args) {
+    try {
+        const r = await sendEditorCommand('duplicate_node', args);
+        return { content: [{ type: 'text', text: `Duplicated: ${r.name} at ${r.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorReparentNode(args) {
+    try {
+        await sendEditorCommand('reparent_node', args);
+        return { content: [{ type: 'text', text: `Reparented: ${args.path} → ${args.new_parent}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorMoveNode(args) {
+    try {
+        const method = args.position.includes('Vector3') ? 'move_node_3d' : 'move_node';
+        await sendEditorCommand(method, args);
+        return { content: [{ type: 'text', text: `Moved ${args.node_path} to ${args.position}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRunSpecificScene(args) {
+    try {
+        await sendEditorCommand('run_specific_scene', args);
+        return { content: [{ type: 'text', text: `Running scene: ${args.scene}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRunGdscript(args) {
+    try {
+        const r = await sendEditorCommand('run_gdscript', args);
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `GDScript executed.\nResult: ${r.result || 'void'}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorCreateScript(args) {
+    try {
+        const r = await sendEditorCommand('create_script', args);
+        return { content: [{ type: 'text', text: `Script created: ${r.path} (extends ${r.extends})` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorAttachScript(args) {
+    try {
+        await sendEditorCommand('attach_script', args);
+        return { content: [{ type: 'text', text: `Script ${args.script} attached to ${args.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetBreakpoint(args) {
+    try {
+        await sendEditorCommand('set_breakpoint', args);
+        return { content: [{ type: 'text', text: `Breakpoint set: ${args.script}:${args.line}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorRemoveBreakpoint(args) {
+    try {
+        await sendEditorCommand('remove_breakpoint', args);
+        return { content: [{ type: 'text', text: `Breakpoint removed: ${args.script}:${args.line}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetBreakpoints() {
+    try {
+        const r = await sendEditorCommand('get_breakpoints');
+        const bps = r.breakpoints || [];
+        return { content: [{ type: 'text', text: `Breakpoints (${bps.length}):\n${JSON.stringify(bps, null, 2)}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSaveAll() {
+    try {
+        await sendEditorCommand('save_all_scenes');
+        return { content: [{ type: 'text', text: 'All scenes saved.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorFocus() {
+    try {
+        await sendEditorCommand('focus_editor');
+        return { content: [{ type: 'text', text: 'Editor focused.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorOpenDock(args) {
+    try {
+        await sendEditorCommand('open_dock', args);
+        return { content: [{ type: 'text', text: `Dock opened: ${args.dock}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorListFilesystem(args) {
+    try {
+        const r = await sendEditorCommand('list_filesystem', args);
+        const dirs = (r.files || []).filter((f) => f.type === 'dir');
+        const files = (r.files || []).filter((f) => f.type === 'file');
+        const lines = [`Directory: ${r.path}`, `Dirs: ${dirs.length}, Files: ${files.length}`, ''];
+        for (const f of r.files || []) {
+            lines.push(`  [${f.type}] ${f.path}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorHealthCheck() {
+    try {
+        await sendEditorCommand('get_editor_version');
+        return { content: [{ type: 'text', text: 'Editor is reachable.' }] };
+    }
+    catch (err) {
+        return toolError(ErrorCode.EDITOR_NOT_REACHABLE, 'Editor is NOT reachable.', err.message);
+    }
+}
+export async function handleEditorDeleteSelected() {
+    try {
+        const r = await sendEditorCommand('delete_selected');
+        return { content: [{ type: 'text', text: `Deleted ${r.deleted} node(s).` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetRect() {
+    try {
+        const r = await sendEditorCommand('get_editor_rect');
+        return { content: [{ type: 'text', text: `Editor window: ${r.width} x ${r.height}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorShowInFilesystem(args) {
+    try {
+        await sendEditorCommand('show_in_filesystem', args);
+        return { content: [{ type: 'text', text: `Revealed: ${args.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- v2.0: Debugger, Settings, Signals, Scenes, Input, Plugins ----
+export const editorCreateSceneSchema = {
+    path: z.string().describe('Path for new scene'), root_type: z.string().optional().default('Node2D'), root_name: z.string().optional(),
+};
+export const editorInstantiateSceneSchema = {
+    scene: z.string().describe('PackedScene path to instantiate'), parent: z.string().optional().default('.'), name: z.string().optional(),
+};
+export const editorSetMainSceneSchema = { scene: z.string().describe('Scene path to set as main') };
+export const editorDebugContinueSchema = {};
+export const editorDebugStepSchema = {};
+export const editorDebugStepOverSchema = {};
+export const editorDebugBreakSchema = {};
+export const editorGetStackTraceSchema = {};
+export const editorGetDebugVariablesSchema = {};
+export const editorEvaluateExpressionSchema = { expression: z.string().describe('GDScript expression to evaluate') };
+export const editorGetEditorSettingSchema = { key: z.string().describe('Setting key') };
+export const editorSetEditorSettingSchema = { key: z.string(), value: z.string() };
+export const editorGetProjectSettingSchema = { key: z.string() };
+export const editorSetProjectSettingSchema = { key: z.string(), value: z.string() };
+export const editorConnectSignalSchema = {
+    node: z.string(), signal: z.string(), target: z.string().optional(), method: z.string(),
+};
+export const editorDisconnectSignalSchema = {
+    node: z.string(), signal: z.string(), target: z.string().optional(), method: z.string().optional(),
+};
+export const editorListNodeSignalsSchema = { node: z.string() };
+export const editorGetSceneChangesSchema = {};
+export const editorGetRecentScenesSchema = {};
+export const editorGetProjectDirectorySchema = {};
+export const editorSimulateKeySchema = {
+    key: z.string().describe('Key name (e.g. "F5", "Ctrl+S" via modifiers)'),
+    modifiers: z.record(z.boolean()).optional().describe('{ctrl, shift, alt} booleans'),
+};
+export const editorGetPluginListSchema = {};
+export const editorEnablePluginSchema = { plugin: z.string() };
+export const editorDisablePluginSchema = { plugin: z.string() };
+export const editorTakeScreenshotSchema = { path: z.string().optional().default('res://editor_screenshot.png') };
+export async function handleEditorCreateScene(args) {
+    try {
+        const r = await sendEditorCommand('create_scene', args);
+        return { content: [{ type: 'text', text: `Scene created: ${r.path} (${r.root})` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorInstantiateScene(args) {
+    try {
+        const r = await sendEditorCommand('instantiate_scene', args);
+        return { content: [{ type: 'text', text: `Instantiated: ${r.name} (${r.type}) at ${r.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetMainScene(args) {
+    try {
+        await sendEditorCommand('set_main_scene', args);
+        return { content: [{ type: 'text', text: `Main scene set: ${args.scene}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDebugContinue() {
+    try {
+        await sendEditorCommand('debug_continue');
+        return { content: [{ type: 'text', text: 'Debugger continued.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDebugStep() {
+    try {
+        await sendEditorCommand('debug_step');
+        return { content: [{ type: 'text', text: 'Step into.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDebugStepOver() {
+    try {
+        await sendEditorCommand('debug_step_over');
+        return { content: [{ type: 'text', text: 'Step over.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDebugBreak() {
+    try {
+        await sendEditorCommand('debug_break');
+        return { content: [{ type: 'text', text: 'Execution stopped.' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetStackTrace() {
+    try {
+        const r = await sendEditorCommand('get_stack_trace');
+        return { content: [{ type: 'text', text: `Stack (${r.count} frames):\n${JSON.stringify(r.stack, null, 2)}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetDebugVariables() {
+    try {
+        const r = await sendEditorCommand('get_debug_variables');
+        return { content: [{ type: 'text', text: `Variables:\n${JSON.stringify(r.variables, null, 2)}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorEvaluateExpression(args) {
+    try {
+        const r = await sendEditorCommand('evaluate_expression', args);
+        return { content: [{ type: 'text', text: r.error ? r.error : `Result: ${r.result}` }], isError: !!r.error };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetEditorSetting(args) {
+    try {
+        const r = await sendEditorCommand('get_editor_setting', args);
+        return { content: [{ type: 'text', text: r.error ? r.error : `${r.key} = ${r.value}` }], isError: !!r.error };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetEditorSetting(args) {
+    try {
+        await sendEditorCommand('set_editor_setting', args);
+        return { content: [{ type: 'text', text: `Editor setting: ${args.key} = ${args.value}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetProjectSetting(args) {
+    try {
+        const r = await sendEditorCommand('get_project_setting', args);
+        return { content: [{ type: 'text', text: r.error ? r.error : `${r.key} = ${r.value}` }], isError: !!r.error };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSetProjectSetting(args) {
+    try {
+        await sendEditorCommand('set_project_setting', args);
+        return { content: [{ type: 'text', text: `Project setting: ${args.key} = ${args.value}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorConnectSignal(args) {
+    try {
+        await sendEditorCommand('connect_editor_signal', args);
+        return { content: [{ type: 'text', text: `Signal connected: ${args.signal} on ${args.node}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDisconnectSignal(args) {
+    try {
+        await sendEditorCommand('disconnect_editor_signal', args);
+        return { content: [{ type: 'text', text: `Signal disconnected: ${args.signal}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorListNodeSignals(args) {
+    try {
+        const r = await sendEditorCommand('list_node_signals', args);
+        const lines = [`${r.node} signals:`];
+        for (const s of r.signals || [])
+            lines.push(`  ${s.name} (${s.connections} connections)`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetSceneChanges() {
+    try {
+        const r = await sendEditorCommand('get_scene_changes');
+        const parts = [`Scene: ${r.scene || 'none'}`, `Modified: ${r.modified}`];
+        if (r.last_action)
+            parts.push(`Last action: ${r.last_action}`);
+        if (r.can_undo !== undefined)
+            parts.push(`Undo: ${r.can_undo ? 'available' : 'empty'}`);
+        if (r.can_redo !== undefined)
+            parts.push(`Redo: ${r.can_redo ? 'available' : 'empty'}`);
+        return { content: [{ type: 'text', text: parts.join(' | ') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetRecentScenes() {
+    try {
+        const r = await sendEditorCommand('get_recent_scenes');
+        return { content: [{ type: 'text', text: `Recent: ${(r.recent || []).join(', ')}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetProjectDirectory() {
+    try {
+        const r = await sendEditorCommand('get_project_directory');
+        return { content: [{ type: 'text', text: `Res: ${r.res} | User: ${r.user}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorSimulateKey(args) {
+    try {
+        await sendEditorCommand('simulate_key_press', args);
+        return { content: [{ type: 'text', text: `Key simulated: ${args.key}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorGetPluginList() {
+    try {
+        const r = await sendEditorCommand('get_plugin_list');
+        const lines = [`Plugins (${r.count}):`];
+        for (const p of r.plugins || [])
+            lines.push(`  ${p.enabled ? '[ON]' : '[OFF]'} ${p.id} — ${p.name} v${p.version}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorEnablePlugin(args) {
+    try {
+        await sendEditorCommand('enable_plugin', args);
+        return { content: [{ type: 'text', text: `Plugin enabled: ${args.plugin}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorDisablePlugin(args) {
+    try {
+        await sendEditorCommand('disable_plugin', args);
+        return { content: [{ type: 'text', text: `Plugin disabled: ${args.plugin}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export async function handleEditorTakeScreenshot(args) {
+    try {
+        const r = await sendEditorCommand('take_screenshot', args);
+        return { content: [{ type: 'text', text: r.error ? r.error : `Screenshot saved: ${r.path}` }], isError: !!r.error };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- v3.0: Class Introspection, Filesystem CRUD, Camera, Autoload, InputMap, Errors, Bake, Runtime ----
+export const editorGetClassListSchema = { filter: z.string().optional(), extends: z.string().optional() };
+export const editorGetMethodListSchema = { class: z.string() };
+export const editorGetClassPropertyListSchema = { class: z.string() };
+export const editorGetClassSignalListSchema = { class: z.string() };
+export const editorGetClassDocSchema = { class: z.string() };
+export const editorSearchHelpSchema = { query: z.string() };
+export const editorCreateFolderSchema = { path: z.string() };
+export const editorDeleteAssetSchema = { path: z.string() };
+export const editorRenameAssetSchema = { from: z.string(), to: z.string() };
+export const editorMoveAssetSchema = { from: z.string(), to: z.string() };
+export const editorDuplicateAssetSchema = { from: z.string(), to: z.string() };
+export const editorGetEditorCameraSchema = {};
+export const editorSetEditorCameraSchema = { position: z.string() };
+export const editorToggleGridSchema = {};
+export const editorToggleSnapSchema = {};
+export const editorGetAutoloadListSchema = {};
+export const editorAddAutoloadSchema = { name: z.string(), path: z.string() };
+export const editorRemoveAutoloadSchema = { name: z.string() };
+export const editorGetInputMapSchema = {};
+export const editorAddInputActionSchema = { name: z.string(), deadzone: z.number().optional().default(0.5) };
+export const editorRemoveInputActionSchema = { name: z.string() };
+export const editorGetErrorListSchema = {};
+export const editorClearErrorsSchema = {};
+export const editorReimportAssetSchema = { path: z.string() };
+export const editorBakeLightmapsSchema = {};
+export const editorBakeNavigationSchema = {};
+export const editorGetRunningSceneTreeSchema = {};
+export const editorGetPerformanceMonitorsSchema = {};
+export const editorGetDependencyListSchema = { path: z.string() };
+// Class introspection
+export async function handleEditorGetClassList(args) {
+    try {
+        const r = await sendEditorCommand('get_class_list', args);
+        return { content: [{ type: 'text', text: `Classes (${r.count}):\n${(r.classes || []).join(', ')}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetMethodList(args) {
+    try {
+        const r = await sendEditorCommand('get_method_list', args);
+        const lines = [`${r.class} methods (${r.count}):`];
+        for (const m of r.methods || [])
+            lines.push(`  ${m.name}(${(m.args || []).map((a) => `${a.name}:${a.type}`).join(', ')}) → ${m.returns}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetClassPropertyList(args) {
+    try {
+        const r = await sendEditorCommand('get_property_list', args);
+        const lines = [`${r.class} properties (${r.count}):`];
+        for (const p of r.properties || [])
+            lines.push(`  ${p.name}: ${p.type}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetClassSignalList(args) {
+    try {
+        const r = await sendEditorCommand('get_signal_list', args);
+        const lines = [`${r.class} signals (${r.count}):`];
+        for (const s of r.signals || [])
+            lines.push(`  ${s.name}(${(s.args || []).join(',')})`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetClassDoc(args) {
+    try {
+        await sendEditorCommand('get_class_doc', args);
+        return { content: [{ type: 'text', text: `Opening docs for ${args.class} in browser.` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorSearchHelp(args) {
+    try {
+        await sendEditorCommand('search_help', args);
+        return { content: [{ type: 'text', text: `Searching Godot docs for: ${args.query}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Filesystem CRUD
+export async function handleEditorCreateFolder(args) {
+    try {
+        await sendEditorCommand('create_folder', args);
+        return { content: [{ type: 'text', text: `Folder created: ${args.path}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorDeleteAsset(args) {
+    try {
+        await sendEditorCommand('delete_asset', args);
+        return { content: [{ type: 'text', text: `Asset deleted: ${args.path}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorRenameAsset(args) {
+    try {
+        await sendEditorCommand('rename_asset', args);
+        return { content: [{ type: 'text', text: `Renamed: ${args.from} → ${args.to}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorMoveAsset(args) {
+    try {
+        await sendEditorCommand('move_asset', args);
+        return { content: [{ type: 'text', text: `Moved: ${args.from} → ${args.to}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorDuplicateAsset(args) {
+    try {
+        await sendEditorCommand('duplicate_asset', args);
+        return { content: [{ type: 'text', text: `Duplicated: ${args.from} → ${args.to}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Editor Viewport
+export async function handleEditorGetEditorCamera() {
+    try {
+        const r = await sendEditorCommand('get_editor_camera');
+        return { content: [{ type: 'text', text: r.error ? r.error : `Editor camera: ${r.position} rot=${r.rotation} fov=${r.fov}` }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorSetEditorCamera(args) {
+    try {
+        await sendEditorCommand('set_editor_camera', args);
+        return { content: [{ type: 'text', text: `Camera moved to ${args.position}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorToggleGrid() {
+    try {
+        await sendEditorCommand('toggle_grid');
+        return { content: [{ type: 'text', text: 'Grid toggled.' }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorToggleSnap() {
+    try {
+        await sendEditorCommand('toggle_snap');
+        return { content: [{ type: 'text', text: 'Snap toggled.' }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Autoload via Editor
+export async function handleEditorGetAutoloadList() {
+    try {
+        const r = await sendEditorCommand('get_autoload_list');
+        const lines = [`Autoloads (${r.count}):`];
+        for (const a of r.autoloads || [])
+            lines.push(`  ${a.name} → ${a.path}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorAddAutoload(args) {
+    try {
+        await sendEditorCommand('add_autoload', args);
+        return { content: [{ type: 'text', text: `Autoload added: ${args.name} → ${args.path}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorRemoveAutoload(args) {
+    try {
+        await sendEditorCommand('remove_autoload', args);
+        return { content: [{ type: 'text', text: `Autoload removed: ${args.name}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Input Map via Editor
+export async function handleEditorGetInputMap() {
+    try {
+        const r = await sendEditorCommand('get_input_map');
+        const lines = [`Input Map (${r.count} actions):`];
+        for (const a of r.actions || []) {
+            lines.push(`  ${a.name} (deadzone=${a.deadzone})`);
+            for (const e of a.events || [])
+                lines.push(`    ${e}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorAddInputAction(args) {
+    try {
+        await sendEditorCommand('add_input_action', args);
+        return { content: [{ type: 'text', text: `Input action added: ${args.name}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorRemoveInputAction(args) {
+    try {
+        await sendEditorCommand('remove_input_action', args);
+        return { content: [{ type: 'text', text: `Input action removed: ${args.name}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Errors
+export async function handleEditorGetErrorList() {
+    try {
+        const r = await sendEditorCommand('get_error_list');
+        return { content: [{ type: 'text', text: `Errors (${r.count}):\n${(r.output || []).join('\n')}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorClearErrors() {
+    try {
+        await sendEditorCommand('clear_errors');
+        return { content: [{ type: 'text', text: 'Error list cleared.' }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Build/Bake
+export async function handleEditorReimportAsset(args) {
+    try {
+        await sendEditorCommand('reimport_asset', args);
+        return { content: [{ type: 'text', text: `Reimporting: ${args.path}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorBakeLightmaps() {
+    try {
+        const r = await sendEditorCommand('bake_lightmaps');
+        return { content: [{ type: 'text', text: r.message || 'Baking lightmaps...' }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorBakeNavigation() {
+    try {
+        await sendEditorCommand('bake_navigation');
+        return { content: [{ type: 'text', text: 'Navigation meshes baked.' }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// Runtime Inspection
+export async function handleEditorGetRunningSceneTree() {
+    try {
+        const r = await sendEditorCommand('get_running_scene_tree');
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetPerformanceMonitors() {
+    try {
+        const r = await sendEditorCommand('get_performance_monitors');
+        return { content: [{ type: 'text', text: `FPS: ${r.fps}\n${JSON.stringify(r.monitors, null, 2)}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorGetDependencyList(args) {
+    try {
+        const r = await sendEditorCommand('get_dependency_list', args);
+        return { content: [{ type: 'text', text: `Dependencies (${r.count}):\n${(r.dependencies || []).join('\n')}` }] };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// ---- Clipboard & Playback (plugin commands already implemented) ----
+export const editorCutSchema = {};
+export const editorCopySchema = {};
+export const editorPasteSchema = { parent: z.string().optional().default('.').describe('Parent node path for paste target (defaults to selected node or scene root)') };
+export const editorPauseSchema = {};
+export const editorUnpauseSchema = {};
+export async function handleEditorCut() {
+    try {
+        const r = await sendEditorCommand('cut_selected');
+        return { content: [{ type: 'text', text: r.error ? r.error : `Cut ${r.cut ?? 0} node(s) to editor clipboard.` }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorCopy() {
+    try {
+        const r = await sendEditorCommand('copy_selected');
+        return { content: [{ type: 'text', text: r.error ? r.error : `Copied ${r.copied ?? 0} node(s) to editor clipboard.` }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorPaste(args) {
+    try {
+        const r = await sendEditorCommand('paste', args.parent && args.parent !== '.' ? { parent: args.parent } : {});
+        return { content: [{ type: 'text', text: r.error ? r.error : `Pasted ${r.pasted ?? 0} node(s).` }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorPause() {
+    try {
+        const r = await sendEditorCommand('pause_project');
+        return { content: [{ type: 'text', text: r.error ? r.error : (r.message || 'Editor scene tree paused.') }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+export async function handleEditorUnpause() {
+    try {
+        const r = await sendEditorCommand('unpause_project');
+        return { content: [{ type: 'text', text: r.error ? r.error : (r.message || 'Editor scene tree resumed.') }], isError: !!r.error };
+    }
+    catch (e) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+    }
+}
+// ---- Node property setters (reuse editor set_node_properties) ----
+const nodePropSetterSchema = {
+    node_path: z.string().describe('Node path in the currently open scene'),
+    param: z.string().describe('Property key to set (e.g. "mass", "energy", "visible")'),
+    value: z.string().describe('Property value as GDScript literal (e.g. "40.0", "true", "Color(1,0,0,1)")'),
+};
+function makeNodePropSetter() {
+    return async (args) => {
+        try {
+            await sendEditorCommand('set_node_properties', { path: args.node_path, properties: { [args.param]: args.value } });
+            return { content: [{ type: 'text', text: `Set ${args.node_path}.${args.param} = ${args.value}` }] };
+        }
+        catch (e) {
+            return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+        }
+    };
+}
+export const editorSetCharacterBodyParamSchema = nodePropSetterSchema;
+export const handleEditorSetCharacterBodyParam = makeNodePropSetter();
+export const editorSetAnimatedSpriteParamSchema = nodePropSetterSchema;
+export const handleEditorSetAnimatedSpriteParam = makeNodePropSetter();
+export const editorSetAudioPlayerParamSchema = nodePropSetterSchema;
+export const handleEditorSetAudioPlayerParam = makeNodePropSetter();
+export const editorSetVideoPlayerParamSchema = nodePropSetterSchema;
+export const handleEditorSetVideoPlayerParam = makeNodePropSetter();
+export const editorSetParallaxParamSchema = nodePropSetterSchema;
+export const handleEditorSetParallaxParam = makeNodePropSetter();
+export const editorSetRichTextParamSchema = nodePropSetterSchema;
+export const handleEditorSetRichTextParam = makeNodePropSetter();
+export const editorSetContainerParamSchema = nodePropSetterSchema;
+export const handleEditorSetContainerParam = makeNodePropSetter();
+export const editorSetTabContainerParamSchema = nodePropSetterSchema;
+export const handleEditorSetTabContainerParam = makeNodePropSetter();
+export const editorSetCameraParamSchema = nodePropSetterSchema;
+export const handleEditorSetCameraParam = makeNodePropSetter();
+export const editorSetParticlesParamSchema = nodePropSetterSchema;
+export const handleEditorSetParticlesParam = makeNodePropSetter();
+export const editorSetViewportParamSchema = nodePropSetterSchema;
+export const handleEditorSetViewportParam = makeNodePropSetter();
+export const editorSetAreaParamSchema = nodePropSetterSchema;
+export const handleEditorSetAreaParam = makeNodePropSetter();
+export const editorSetDecalParamSchema = nodePropSetterSchema;
+export const handleEditorSetDecalParam = makeNodePropSetter();
+export const editorSetOccluderParamSchema = nodePropSetterSchema;
+export const handleEditorSetOccluderParam = makeNodePropSetter();
+export const editorSetMarkerParamSchema = nodePropSetterSchema;
+export const handleEditorSetMarkerParam = makeNodePropSetter();
+export const editorSetSoftBodyParamSchema = nodePropSetterSchema;
+export const handleEditorSetSoftBodyParam = makeNodePropSetter();
+export const editorSetAudioListenerParamSchema = nodePropSetterSchema;
+export const handleEditorSetAudioListenerParam = makeNodePropSetter();
+export const editorSetMultiplayerSpawnerParamSchema = nodePropSetterSchema;
+export const handleEditorSetMultiplayerSpawnerParam = makeNodePropSetter();
+export const editorSetMultiplayerSynchronizerParamSchema = nodePropSetterSchema;
+export const handleEditorSetMultiplayerSynchronizerParam = makeNodePropSetter();
+// ---- Typed node creators (reuse editor add_node) ----
+const createTypedNodeSchema = {
+    name: z.string().optional().describe('Node name (auto-generated if omitted)'),
+    parent: z.string().optional().default('.').describe('Parent node path'),
+    properties: z.record(z.string()).optional().describe('Properties to set on the new node'),
+};
+function makeTypedNodeCreator(type) {
+    return async (args) => {
+        try {
+            const r = await sendEditorCommand('add_node', { type, name: args.name, parent: args.parent || '.', properties: args.properties || {} });
+            return { content: [{ type: 'text', text: `Created ${type}: ${r.name} at ${r.path}` }] };
+        }
+        catch (e) {
+            return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, e);
+        }
+    };
+}
+export const editorCreateCameraSchema = createTypedNodeSchema;
+export const handleEditorCreateCamera = makeTypedNodeCreator('Camera3D');
+export const editorCreateMeshInstanceSchema = createTypedNodeSchema;
+export const handleEditorCreateMeshInstance = makeTypedNodeCreator('MeshInstance3D');
+export const editorCreateMultiplayerSpawnerSchema = createTypedNodeSchema;
+// NOTE: these are plain `Node` subclasses — there is no 2D/3D variant.
+// See modules/multiplayer/register_types.cpp:49-50 (GDREGISTER_CLASS(MultiplayerSpawner)).
+// They used to be created as "MultiplayerSpawner3D"/"MultiplayerSynchronizer3D",
+// which are not real classes, so both tools failed 100% of the time.
+export const handleEditorCreateMultiplayerSpawner = makeTypedNodeCreator('MultiplayerSpawner');
+export const editorCreateMultiplayerSynchronizerSchema = createTypedNodeSchema;
+export const handleEditorCreateMultiplayerSynchronizer = makeTypedNodeCreator('MultiplayerSynchronizer');
+export const editorCreateCsgBoxSchema = createTypedNodeSchema;
+export const handleEditorCreateCsgBox = makeTypedNodeCreator('CSGBox3D');
+export const editorCreateCsgSphereSchema = createTypedNodeSchema;
+export const handleEditorCreateCsgSphere = makeTypedNodeCreator('CSGSphere3D');
+export const editorCreateCsgCylinderSchema = createTypedNodeSchema;
+export const handleEditorCreateCsgCylinder = makeTypedNodeCreator('CSGCylinder3D');
+export const editorCreateCsgMergeSchema = createTypedNodeSchema;
+export const handleEditorCreateCsgMerge = makeTypedNodeCreator('CSGCombiner3D');
+export const editorCreateCsgPolygonSchema = createTypedNodeSchema;
+export const handleEditorCreateCsgPolygon = makeTypedNodeCreator('CSGPolygon3D');
+export const editorCreateGpuParticlesSchema = createTypedNodeSchema;
+export const handleEditorCreateGpuParticles = makeTypedNodeCreator('GPUParticles3D');
+// ============================================================
+// Editor Interface coverage (APIs the bridge previously skipped)
+// Verified against editor/editor_interface.cpp _bind_methods().
+// ============================================================
+// ---- Scene lifecycle ----
+export const editorSaveSceneAsSchema = {
+    path: z.string().describe('Destination scene path, must start with res:// (e.g. res://levels/level2.tscn)'),
+    with_preview: z.boolean().optional().default(true).describe('Generate a thumbnail preview for the FileSystem dock'),
+};
+export async function handleEditorSaveSceneAs(args) {
+    try {
+        const r = await sendEditorCommand('save_scene_as', { path: args.path, with_preview: args.with_preview ?? true });
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Scene saved as: ${r.path}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorCloseSceneSchema = {};
+export async function handleEditorCloseScene() {
+    try {
+        const r = await sendEditorCommand('close_scene');
+        if (r.error)
+            return plainError(r.error);
+        if (!r.closed)
+            return { content: [{ type: 'text', text: r.message || 'Scene not closed.' }] };
+        return { content: [{ type: 'text', text: `Closed scene: ${r.scene || '(unsaved)'}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorGetOpenScenesSchema = {};
+export async function handleEditorGetOpenScenes() {
+    try {
+        const [open, unsaved] = await Promise.all([
+            sendEditorCommand('get_open_scenes'),
+            sendEditorCommand('get_unsaved_scenes').catch(() => ({ scenes: null })),
+        ]);
+        const scenes = open.scenes || [];
+        if (scenes.length === 0)
+            return { content: [{ type: 'text', text: 'No scenes open in the editor.' }] };
+        const dirty = new Set(Array.isArray(unsaved.scenes) ? unsaved.scenes : []);
+        const lines = [`${scenes.length} open scene(s):`];
+        for (const s of scenes)
+            lines.push(`  ${dirty.has(s) ? '*' : ' '} ${s}`);
+        if (dirty.size > 0)
+            lines.push('', '(* = unsaved changes)');
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorGetUnsavedScenesSchema = {};
+export async function handleEditorGetUnsavedScenes() {
+    try {
+        const r = await sendEditorCommand('get_unsaved_scenes');
+        if (r.error)
+            return plainError(r.error);
+        const scenes = r.scenes || [];
+        if (scenes.length === 0)
+            return { content: [{ type: 'text', text: 'No unsaved scenes - everything is committed to disk.' }] };
+        return { content: [{ type: 'text', text: `${scenes.length} scene(s) with unsaved changes:\n${scenes.map(s => `  ${s}`).join('\n')}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorMarkSceneUnsavedSchema = {};
+export async function handleEditorMarkSceneUnsaved() {
+    try {
+        const r = await sendEditorCommand('mark_scene_unsaved');
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: 'Current scene marked as unsaved (editor will prompt to save).' }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- Playback ----
+export const editorPlayCurrentSceneSchema = {};
+export async function handleEditorPlayCurrentScene() {
+    try {
+        const r = await sendEditorCommand('play_current_scene');
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Playing current scene: ${r.scene}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorGetPlayingSceneSchema = {};
+export async function handleEditorGetPlayingScene() {
+    try {
+        const r = await sendEditorCommand('get_playing_scene');
+        if (!r.playing)
+            return { content: [{ type: 'text', text: 'No scene is currently playing.' }] };
+        return { content: [{ type: 'text', text: `Playing: ${r.scene || '(main scene)'}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- FileSystem dock / script editor ----
+export const editorGetFilesystemSelectionSchema = {};
+export async function handleEditorGetFilesystemSelection() {
+    try {
+        const r = await sendEditorCommand('get_filesystem_selection');
+        const sel = r.selected_paths || [];
+        const lines = [
+            `Current directory: ${r.current_directory || '(none)'}`,
+            `Current path:      ${r.current_path || '(none)'}`,
+            `Selected:          ${sel.length} path(s)`,
+        ];
+        for (const p of sel)
+            lines.push(`  ${p}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorOpenScriptAtLineSchema = {
+    path: z.string().describe('Script path, e.g. res://player.gd'),
+    line: z.number().optional().default(1).describe('Line to jump to (1-based)'),
+    column: z.number().optional().default(0).describe('Column to place the caret at'),
+    grab_focus: z.boolean().optional().default(true).describe('Focus the script editor after opening'),
+};
+export async function handleEditorOpenScriptAtLine(args) {
+    try {
+        const r = await sendEditorCommand('open_script_at_line', {
+            path: args.path, line: args.line ?? 1, column: args.column ?? 0, grab_focus: args.grab_focus ?? true,
+        });
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Opened ${r.path} at line ${r.line}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+// ---- Editor UI / environment ----
+export const editorShowToastSchema = {
+    message: z.string().describe('Toast text to display in the editor'),
+    severity: z.enum(['info', 'warning', 'error']).optional().default('info').describe('Toast severity/color'),
+    tooltip: z.string().optional().describe('Optional tooltip shown on hover'),
+};
+export async function handleEditorShowToast(args) {
+    try {
+        const r = await sendEditorCommand('show_toast', { message: args.message, severity: args.severity || 'info', tooltip: args.tooltip || '' });
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Toast shown (${r.severity}): ${args.message}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorSetDistractionFreeSchema = {
+    enabled: z.boolean().optional().describe('Turn distraction-free mode on/off. Omit to just read the current state.'),
+};
+export async function handleEditorSetDistractionFree(args) {
+    try {
+        const r = await sendEditorCommand('set_distraction_free', args.enabled === undefined ? {} : { enabled: args.enabled });
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Distraction-free mode: ${r.enabled ? 'on' : 'off'}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorSetMovieMakerSchema = {
+    enabled: z.boolean().optional().describe('Enable Movie Maker mode so the next play session records to a video file. Omit to read the current state.'),
+};
+export async function handleEditorSetMovieMaker(args) {
+    try {
+        const r = await sendEditorCommand('set_movie_maker', args.enabled === undefined ? {} : { enabled: args.enabled });
+        if (r.error)
+            return plainError(r.error);
+        const hint = r.enabled
+            ? '\nSet application/run/movie_writer/movie_file in project.godot (plus mjpeg_quality / fps) to control the output.'
+            : '';
+        return { content: [{ type: 'text', text: `Movie Maker mode: ${r.enabled ? 'on' : 'off'}${hint}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorGet3dSnapSchema = {};
+export async function handleEditorGet3dSnap() {
+    try {
+        const r = await sendEditorCommand('get_3d_snap');
+        const lines = [
+            `3D snap: ${r.snap_enabled ? 'enabled' : 'disabled'}`,
+            `  translate: ${r.translate_snap}`,
+            `  rotate:    ${r.rotate_snap}`,
+            `  scale:     ${r.scale_snap}`,
+        ];
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorGetPathsSchema = {};
+export async function handleEditorGetPaths() {
+    try {
+        const r = await sendEditorCommand('get_editor_paths');
+        const lines = [
+            'Editor paths:',
+            `  data:              ${r.data_dir || '?'}`,
+            `  config:            ${r.config_dir || '?'}`,
+            `  cache:             ${r.cache_dir || '?'}`,
+            `  project settings:  ${r.project_settings_dir || '?'}`,
+            `  self-contained:    ${r.self_contained ? 'yes' : 'no'}`,
+            '',
+            `  editor scale:      ${r.editor_scale}`,
+            `  editor language:   ${r.editor_language}`,
+            `  multi-window:      ${r.multi_window ? 'yes' : 'no'}`,
+        ];
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorRestartSchema = {
+    confirm: z.boolean().describe('Must be true - restarting closes the editor and drops the MCP bridge connection.'),
+    save: z.boolean().optional().default(true).describe('Save all open scenes before restarting'),
+};
+export async function handleEditorRestart(args) {
+    try {
+        const r = await sendEditorCommand('restart_editor', { confirm: args.confirm, save: args.save ?? true });
+        if (r.error)
+            return plainError(r.error);
+        return { content: [{ type: 'text', text: `Editor restarting (saved: ${r.saved ? 'yes' : 'no'}). The bridge will be unreachable until it comes back up.` }] };
+    }
+    catch {
+        // A restart tears down the socket mid-flight; that is expected, not a failure.
+        return { content: [{ type: 'text', text: 'Editor restart requested - the bridge connection dropped as expected. Reconnect once the editor is back.' }] };
+    }
+}
+// ---- Playback / selection convenience ----
+export const editorIsPlayingSchema = {};
+export async function handleEditorIsPlaying() {
+    try {
+        const r = await sendEditorCommand('is_playing');
+        if (r.error)
+            return plainError(r.error);
+        const playing = r.playing ? 'yes' : 'no';
+        const scene = r.scene ? String(r.scene) : '(none)';
+        return { content: [{ type: 'text', text: `Playing: ${playing}\nScene: ${scene}` }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}
+export const editorSelectNodeSchema = {
+    node_path: z.string().describe('Node path to select (e.g. "Player" or "World/Enemies/Boss")'),
+    property: z.string().optional().describe('Optional property to set on the node after selecting (GDScript literal)'),
+    value: z.string().optional().describe('Value for the optional property'),
+};
+export async function handleEditorSelectNode(args) {
+    try {
+        const params = { node_path: args.node_path };
+        if (args.property)
+            params.property = args.property;
+        if (args.value)
+            params.value = args.value;
+        const r = await sendEditorCommand('select_node', params);
+        if (r.error)
+            return plainError(r.error);
+        const msg = args.property
+            ? `Selected "${args.node_path}" + set ${args.property}=${args.value}`
+            : `Selected: ${args.node_path}`;
+        return { content: [{ type: 'text', text: msg }] };
+    }
+    catch (err) {
+        return wrapError(ErrorCode.EDITOR_NOT_REACHABLE, err);
+    }
+}

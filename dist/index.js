@@ -1,0 +1,336 @@
+#!/usr/bin/env node
+// Copyright (c) 2026 FairYan
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ============================================================
+// Godot MCP Server - Entry Point (v1.12.9)
+// ============================================================
+// 同时支持三种 MCP 通信协议：
+//   - Stdio（标准输入输出，默认）
+//   - SSE（Server-Sent Events，兼容旧客户端）
+//   - Streamable HTTP（MCP 2025 规范）
+// ============================================================
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { findGodotBinary } from './utils/godot_cli.js';
+import { findProjectRoot } from './utils/file_utils.js';
+import { runStdioTransport } from './transports/stdio.js';
+import { runHttpTransport } from './transports/http-server.js';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * 版本号从 package.json 读，别写死第二份——否则又是一个会漂移的副本
+ * （本项目已经因为「同一事实存多处」踩过 tool count 漂移）。
+ */
+const VERSION = (() => {
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8'));
+        return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+    }
+    catch {
+        return '0.0.0';
+    }
+})();
+// ---- 全局异常兜底：防止未捕获的 rejection/异常导致进程崩溃 ----
+process.on('unhandledRejection', (reason) => {
+    console.error('[Godot MCP] Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Godot MCP] Uncaught exception:', err);
+});
+// ---- CLI 参数解析 ----
+function parseArgs() {
+    const args = process.argv.slice(2);
+    const result = {
+        transport: 'stdio',
+        port: 3000,
+        host: '127.0.0.1',
+        enableSse: true,
+        enableStreamableHttp: true,
+    };
+    for (let i = 0; i < args.length; i++) {
+        switch (args[i]) {
+            case '--project-path':
+            case '-p':
+                result.projectPath = args[++i];
+                break;
+            case '--godot-path':
+            case '-g':
+                result.godotPath = args[++i];
+                break;
+            case '--help':
+            case '-h':
+                result.help = true;
+                break;
+            // README 一直把 `--version` 写成「查看版本的命令」，但它之前根本没实现——
+            // 传进去会被当成未知参数忽略，然后照常启动 stdio 服务器并挂住等 stdin。
+            case '--version':
+            case '-v':
+                result.version = true;
+                break;
+            case '--install-addons':
+                result.installAddons = true;
+                break;
+            case '--enable-plugin':
+                result.enablePlugin = true;
+                break;
+            case '--read-only':
+                result.readOnly = true;
+                break;
+            case '--transport':
+            case '-t':
+                result.transport = args[++i];
+                break;
+            case '--port':
+                result.port = parseInt(args[++i], 10);
+                break;
+            case '--host':
+                result.host = args[++i];
+                break;
+            case '--no-sse':
+                result.enableSse = false;
+                break;
+            case '--no-streamable-http':
+                result.enableStreamableHttp = false;
+                break;
+        }
+    }
+    return result;
+}
+// ---- 帮助信息 ----
+function printHelp() {
+    console.log(`
+Godot MCP Server - Model Context Protocol server for Godot Engine
+──────────────────────────────────────────────────────────────────────
+同时支持三种 MCP 通信协议：Stdio、SSE、Streamable HTTP
+
+USAGE:
+  godot-mcp [options]
+
+OPTIONS:
+  --project-path, -p <path>  Godot 项目根目录（默认：自动检测）
+  --godot-path, -g <path>    Godot 可执行文件路径（默认：自动检测）
+  --install-addons            将编辑器插件 (addons/) 安装到目标项目
+  --enable-plugin             安装 addons 并自动在 project.godot 中启用插件
+  --read-only                 只读模式：拒绝 218 个写/副作用工具（安全模式）
+
+TRANSPORT OPTIONS:
+  --transport, -t <mode>     传输协议（默认：stdio）
+                             可选值: stdio | sse | streamable-http | all
+    stdio                     标准输入输出（适用于 Claude Desktop、VS Code）
+    sse                       SSE over HTTP（兼容旧版 MCP 客户端）
+    streamable-http           Streamable HTTP（MCP 2025 规范）
+    all                       同时启动 Stdio + SSE + Streamable HTTP
+
+  --port <number>            HTTP 服务端口（默认：3000）
+  --host <string>            HTTP 监听地址（默认：127.0.0.1）
+  --no-sse                   禁用 SSE 端点
+  --no-streamable-http       禁用 Streamable HTTP 端点
+
+  --help, -h                 显示此帮助信息
+  --version, -v              显示版本号并退出
+
+EXAMPLES:
+  godot-mcp                                      # Stdio 模式（默认）
+  godot-mcp -p /path/to/project                  # 指定项目路径
+  godot-mcp -t sse --port 3000                   # SSE over HTTP
+  godot-mcp -t streamable-http --port 8080       # Streamable HTTP
+  godot-mcp -t all --port 3000                   # 同时三种协议
+  godot-mcp --install-addons -p /path/to/project # 安装编辑器插件
+
+CLIENT CONFIGURATION EXAMPLES:
+  # Claude Desktop / VS Code (stdio):
+  {
+    "mcpServers": {
+      "godot-mcp": {
+        "command": "node",
+        "args": ["E:/文档/product/godot-mcp/dist/index.js", "-p", "/path/to/project"]
+      }
+    }
+  }
+
+  # HTTP 客户端 (SSE):
+  {
+    "mcpServers": {
+      "godot-mcp": {
+        "url": "http://127.0.0.1:3000/sse"
+      }
+    }
+  }
+
+  # HTTP 客户端 (Streamable HTTP):
+  {
+    "mcpServers": {
+      "godot-mcp": {
+        "url": "http://127.0.0.1:3000/mcp",
+        "transportType": "streamable-http"
+      }
+    }
+  }
+`);
+}
+// ---- Addons 安装 ----
+function installAddonsToProject(projectPath) {
+    const sourceAddons = path.resolve(__dirname, '..', 'addons', 'godot-mcp');
+    const targetAddons = path.join(projectPath, 'addons', 'godot-mcp');
+    if (!fs.existsSync(sourceAddons)) {
+        console.error(`Error: addons directory not found at "${sourceAddons}"`);
+        process.exit(1);
+    }
+    if (!fs.existsSync(path.join(sourceAddons, 'plugin.cfg'))) {
+        console.error(`Error: plugin.cfg not found in "${sourceAddons}" — invalid plugin directory`);
+        process.exit(1);
+    }
+    fs.mkdirSync(path.dirname(targetAddons), { recursive: true });
+    fs.cpSync(sourceAddons, targetAddons, { recursive: true, force: true });
+    console.log(`✅ Editor plugin installed: addons/godot-mcp → ${targetAddons}`);
+    console.log('   In Godot: Project → Project Settings → Plugins → Enable "Godot MCP"');
+}
+// ---- 主入口 ----
+async function main() {
+    const config = parseArgs();
+    if (config.help) {
+        printHelp();
+        process.exit(0);
+    }
+    // README 把 `--version` 写成查看版本的命令，这里必须真的处理它并退出：
+    // 否则参数被忽略 → 照常进 stdio 服务器 → 客户端以为命令卡死。
+    if (config.version) {
+        console.log(VERSION);
+        process.exit(0);
+    }
+    // --install-addons: 仅复制 addons 到工程
+    if (config.installAddons) {
+        if (!config.projectPath) {
+            console.error('Error: --install-addons requires --project-path (-p) to specify the target Godot project.');
+            process.exit(1);
+        }
+        const root = findProjectRoot(config.projectPath);
+        if (!root) {
+            console.error(`Error: No Godot project found at "${config.projectPath}" (project.godot not found)`);
+            process.exit(1);
+        }
+        installAddonsToProject(root);
+        process.exit(0);
+    }
+    // --enable-plugin: 安装 addons 并自动在 project.godot 中启用插件
+    if (config.enablePlugin) {
+        if (!config.projectPath) {
+            console.error('Error: --enable-plugin requires --project-path (-p) to specify the target Godot project.');
+            process.exit(1);
+        }
+        const root = findProjectRoot(config.projectPath);
+        if (!root) {
+            console.error(`Error: No Godot project found at "${config.projectPath}" (project.godot not found)`);
+            process.exit(1);
+        }
+        installAddonsToProject(root);
+        // Auto-enable plugin in project.godot
+        const projectFile = path.join(root, 'project.godot');
+        let content = fs.readFileSync(projectFile, 'utf-8');
+        if (!content.includes('[editor_plugins]')) {
+            content += '\n\n[editor_plugins]\n';
+        }
+        if (!content.includes('enabled=PackedStringArray("res://addons/godot-mcp/plugin.cfg"')) {
+            // Find [editor_plugins] section and update
+            const sections = content.split('\n[');
+            let found = false;
+            for (let i = 0; i < sections.length; i++) {
+                if (sections[i].startsWith('editor_plugins]') || sections[i].startsWith('editor_plugins\n')) {
+                    if (!sections[i].includes('godot-mcp')) {
+                        sections[i] = sections[i].replace(/enabled\s*=\s*PackedStringArray\(([^)]*)\)/, (_, plugins) => {
+                            const arr = plugins.split(',').map((s) => s.trim()).filter(Boolean);
+                            arr.push('"res://addons/godot-mcp/plugin.cfg"');
+                            return `enabled=PackedStringArray(${arr.join(', ')})`;
+                        });
+                        // If no enabled line, add one
+                        if (!sections[i].includes('enabled=')) {
+                            sections[i] += '\nenabled=PackedStringArray("res://addons/godot-mcp/plugin.cfg")';
+                        }
+                    }
+                    found = true;
+                }
+            }
+            content = sections.join('\n[');
+            if (!found) {
+                content += 'editor_plugins]\nenabled=PackedStringArray("res://addons/godot-mcp/plugin.cfg")';
+            }
+        }
+        fs.writeFileSync(projectFile, content);
+        console.log('✅ Editor plugin enabled in project.godot');
+        console.log('   Restart Godot for the plugin to take effect.');
+        process.exit(0);
+    }
+    // 设置 GODOT_PATH 环境变量
+    if (config.godotPath) {
+        process.env.GODOT_PATH = config.godotPath;
+    }
+    // --read-only: 设置全局只读模式
+    if (config.readOnly) {
+        process.env.GODOT_MCP_READ_ONLY = 'true';
+        console.error('[Godot MCP] Running in READ-ONLY mode — write operations will be rejected');
+    }
+    // 验证项目路径
+    if (config.projectPath) {
+        const root = findProjectRoot(config.projectPath);
+        if (!root) {
+            console.error(`Error: No Godot project found at "${config.projectPath}" (project.godot not found)`);
+            process.exit(1);
+        }
+    }
+    // Godot 二进制检测提醒
+    const godotBinary = findGodotBinary();
+    if (!godotBinary) {
+        console.error('Warning: Godot binary not found. Set GODOT_PATH or install Godot for engine control features.');
+    }
+    // 根据 transport 模式启动
+    const { transport, port, host, enableSse, enableStreamableHttp, projectPath } = config;
+    switch (transport) {
+        case 'stdio':
+            // 纯 Stdio 模式（默认）
+            await runStdioTransport({ projectRoot: projectPath });
+            break;
+        case 'sse':
+            // 仅 SSE over HTTP
+            await runHttpTransport({
+                port,
+                host,
+                projectRoot: projectPath,
+                enableSse: true,
+                enableStreamableHttp: false,
+            });
+            break;
+        case 'streamable-http':
+            // 仅 Streamable HTTP
+            await runHttpTransport({
+                port,
+                host,
+                projectRoot: projectPath,
+                enableSse: false,
+                enableStreamableHttp: true,
+            });
+            break;
+        case 'all':
+            // 同时启动 Stdio + HTTP（SSE + Streamable HTTP）
+            console.error('[Godot MCP] Starting all transports: Stdio + SSE + Streamable HTTP');
+            // HTTP 服务在后台运行，Stdio 在主线程；HTTP 启动失败（如端口占用）直接报错退出
+            runHttpTransport({
+                port,
+                host,
+                projectRoot: projectPath,
+                enableSse,
+                enableStreamableHttp,
+            }).catch((err) => {
+                console.error(`[Godot MCP] HTTP server failed to start: ${err instanceof Error ? err.message : String(err)}`);
+                process.exit(1);
+            });
+            await runStdioTransport({ projectRoot: projectPath });
+            break;
+        default:
+            console.error(`Error: Unknown transport mode "${transport}". Use --help for usage.`);
+            process.exit(1);
+    }
+}
+main().catch((err) => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+});
